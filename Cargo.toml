@@ -2,8 +2,11 @@
 name = "typm"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.92"
-description = "A Git and local package manager for Typst"
+description = "An experimental package manager for typst"
+license = "MIT"
+homepage = "https://github.com/NanamiNakano/typm"
+repository = "https://github.com/NanamiNakano/typm"
+readme = "README.md"
 
 [dependencies]
 blake3 = "1.8.7"
