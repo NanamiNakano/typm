@@ -1,5 +1,6 @@
 #![cfg(unix)]
 
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs;
 use std::os::unix::ffi::OsStringExt;
@@ -91,6 +92,55 @@ exit "${TYPM_TEST_EXIT:-0}"
         let contents = fs::read_to_string(self.project.join("typm.lock")).unwrap();
         toml::from_str::<toml::Value>(&contents).unwrap();
         contents
+    }
+
+    fn assert_packages(&self, linked: &[(&str, &str)], locked: &[(&str, &str)]) {
+        let paths = |packages: &[(&str, &str)]| {
+            packages
+                .iter()
+                .map(|(name, version)| format!("local/{name}/{version}"))
+                .collect::<BTreeSet<_>>()
+        };
+        let state: toml::Value =
+            toml::from_str(&fs::read_to_string(self.project.join(".typm/state.toml")).unwrap())
+                .unwrap();
+        let state_paths = state["links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|link| {
+                let path = link["path"].as_str().unwrap();
+                let installed = self.project.join(".typm/packages").join(path);
+                assert!(
+                    fs::symlink_metadata(&installed)
+                        .unwrap()
+                        .file_type()
+                        .is_symlink()
+                );
+                assert_eq!(
+                    fs::read_link(&installed).unwrap(),
+                    Path::new(link["target"].as_str().unwrap())
+                );
+                assert!(installed.join("lib.typ").is_file());
+                path.to_owned()
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(state_paths, paths(linked));
+        let lock: toml::Value = toml::from_str(&self.lock()).unwrap();
+        let lock_paths = lock["packages"]
+            .as_table()
+            .unwrap()
+            .values()
+            .map(|package| {
+                format!(
+                    "{}/{}/{}",
+                    package["namespace"].as_str().unwrap(),
+                    package["name"].as_str().unwrap(),
+                    package["version"].as_str().unwrap()
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(lock_paths, paths(locked));
     }
 
     fn local(&self, name: &str) -> PathBuf {
@@ -937,6 +987,276 @@ fn removal_also_prunes_roots_manually_deleted_from_the_manifest() {
     let lock = f.lock();
     assert!(!lock.contains(&first_commit));
     assert!(!lock.contains(&second_commit));
+}
+
+#[test]
+fn commands_reconcile_manual_manifest_edits() {
+    for command in [
+        "add", "remove", "rm", "sync", "update", "compile", "watch", "query", "fonts",
+    ] {
+        let f = Fixture::new();
+        let selected = f.repo("selected");
+        package(&selected.path, "selected", "1.0.0");
+        let older = selected.commit();
+        package(&selected.path, "selected", "2.0.0");
+        let newer = selected.commit();
+        let deleted = f.repo("deleted");
+        package(&deleted.path, "deleted", "1.0.0");
+        let deleted_commit = deleted.commit();
+        let pinned = f.repo("pinned");
+        package(&pinned.path, "pinned", "1.0.0");
+        let pinned_commit = pinned.commit();
+        let removed = f.local("removed");
+        let original = f.local("retargeted");
+        let replacement = f.temp.path().join("local/retargeted-replacement");
+        package(&replacement, "retargeted", "1.0.0");
+        let manual = f.local("manual");
+        let selected_at = |commit: &str| {
+            format!(
+                "selected = {{ git = {:?}, rev = {commit:?} }}",
+                selected.url()
+            )
+        };
+        dependencies(
+            &f.project,
+            &format!(
+                "{}\n{}\n{}\nremoved = {{ path = '../local/removed' }}\nretargeted = {{ path = '../local/retargeted' }}",
+                selected_at(&newer),
+                git_dependency("deleted", &deleted),
+                git_dependency("pinned", &pinned),
+            ),
+        );
+        f.ok(&["sync"]);
+        assert_eq!(
+            fs::canonicalize(f.link("retargeted", "1.0.0")).unwrap(),
+            original
+        );
+        package(&pinned.path, "pinned", "2.0.0");
+        let refreshed_commit = pinned.commit();
+        let retained = format!(
+            "# Keep this manual edit.\n[dependencies]\n{} # selected revision\n{}\nretargeted = {{ path = '../local/retargeted-replacement' }}\nmanual = {{ path = '../local/manual' }}\n",
+            selected_at(&older),
+            git_dependency("pinned", &pinned),
+        );
+        let mut edited = retained.clone();
+        if matches!(command, "remove" | "rm") {
+            edited.push_str("removed = { path = '../local/removed' }\n");
+        }
+        fs::write(f.project.join("typm.toml"), &edited).unwrap();
+        fs::rename(&deleted.path, deleted.path.with_extension("offline")).unwrap();
+        fs::remove_dir_all(removed).unwrap();
+
+        match command {
+            "add" => {
+                f.ok(&["add", "--path", f.local("added").to_str().unwrap()]);
+            }
+            "remove" | "rm" => {
+                f.ok(&[command, "removed"]);
+            }
+            "compile" | "watch" => {
+                f.ok(&[command, "main.typ"]);
+            }
+            "query" => {
+                f.ok(&[command, "main.typ", "<target>"]);
+            }
+            _ => {
+                f.ok(&[command]);
+            }
+        }
+
+        let pinned_version = if command == "update" {
+            "2.0.0"
+        } else {
+            "1.0.0"
+        };
+        let locked = [("selected", "1.0.0"), ("pinned", pinned_version)];
+        let mut linked = locked.to_vec();
+        linked.extend([("retargeted", "1.0.0"), ("manual", "1.0.0")]);
+        if command == "add" {
+            linked.push(("added", "1.0.0"));
+        }
+        f.assert_packages(&linked, &locked);
+        assert_eq!(
+            fs::canonicalize(f.link("retargeted", "1.0.0")).unwrap(),
+            replacement
+        );
+        assert_eq!(fs::canonicalize(f.link("manual", "1.0.0")).unwrap(), manual);
+        for (name, version) in [
+            ("selected", "2.0.0"),
+            ("deleted", "1.0.0"),
+            ("removed", "1.0.0"),
+        ] {
+            assert!(
+                fs::symlink_metadata(f.link(name, version)).is_err(),
+                "{command}: {name}/{version}"
+            );
+        }
+        let lock = f.lock();
+        assert!(lock.contains(&older));
+        for commit in [&newer, &deleted_commit] {
+            assert!(!lock.contains(commit));
+        }
+        assert_eq!(lock.contains(&pinned_commit), command != "update");
+        assert_eq!(lock.contains(&refreshed_commit), command == "update");
+        if command == "update" {
+            assert!(fs::symlink_metadata(f.link("pinned", "1.0.0")).is_err());
+        }
+        let parsed: toml::Value = toml::from_str(&lock).unwrap();
+        assert_eq!(parsed["sources"].as_table().unwrap().len(), 2);
+        assert_eq!(
+            parsed["roots"]
+                .as_table()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["pinned", "selected"])
+        );
+        let manifest = fs::read_to_string(f.project.join("typm.toml")).unwrap();
+        if command == "add" {
+            assert!(manifest.starts_with(&retained));
+        } else {
+            assert_eq!(manifest, retained);
+        }
+        let forwarded = matches!(command, "compile" | "watch" | "query" | "fonts");
+        assert_eq!(f.log.exists(), forwarded);
+        if forwarded {
+            assert!(
+                fs::read_to_string(&f.log)
+                    .unwrap()
+                    .contains(&format!("arg={command}\n"))
+            );
+        }
+    }
+}
+
+#[test]
+fn removal_resolves_edited_local_versions_and_transitives_preserving_shared_versions() {
+    let f = Fixture::new();
+    let shared = f.repo("shared");
+    package(&shared.path, "shared", "1.0.0");
+    let older = shared.commit();
+    package(&shared.path, "shared", "2.0.0");
+    let newer = shared.commit();
+    let obsolete = f.repo("obsolete");
+    package(&obsolete.path, "obsolete", "1.0.0");
+    let obsolete_commit = obsolete.commit();
+    let added = f.repo("added");
+    package(&added.path, "added", "1.0.0");
+    let added_commit = added.commit();
+    let local = f.local("local");
+    let keeper = f.local("keeper");
+    f.local("removed");
+    let shared_at =
+        |commit: &str| format!("shared = {{ git = {:?}, rev = {commit:?} }}", shared.url());
+    dependencies(
+        &local,
+        &format!(
+            "{}\n{}",
+            shared_at(&older),
+            git_dependency("obsolete", &obsolete)
+        ),
+    );
+    dependencies(&keeper, &shared_at(&older));
+    dependencies(
+        &f.project,
+        "local = { path = '../local/local' }\nkeeper = { path = '../local/keeper' }\nremoved = { path = '../local/removed' }",
+    );
+    f.ok(&["sync"]);
+
+    package(&local, "local", "2.0.0");
+    dependencies(
+        &local,
+        &format!("{}\n{}", shared_at(&newer), git_dependency("added", &added)),
+    );
+    f.ok(&["remove", "removed"]);
+
+    let locked = [("shared", "1.0.0"), ("shared", "2.0.0"), ("added", "1.0.0")];
+    let mut linked = locked.to_vec();
+    linked.extend([("local", "2.0.0"), ("keeper", "1.0.0")]);
+    f.assert_packages(&linked, &locked);
+    for name in ["local", "removed", "obsolete"] {
+        assert!(fs::symlink_metadata(f.link(name, "1.0.0")).is_err());
+    }
+    let lock = f.lock();
+    for commit in [&older, &newer, &added_commit] {
+        assert!(lock.contains(commit));
+    }
+    assert!(!lock.contains(&obsolete_commit));
+    let parsed: toml::Value = toml::from_str(&lock).unwrap();
+    assert_eq!(parsed["sources"].as_table().unwrap().len(), 3);
+    assert_eq!(parsed["roots"]["keeper"].as_array().unwrap().len(), 1);
+    assert_eq!(parsed["roots"]["local"].as_array().unwrap().len(), 2);
+    assert!(parsed["roots"].get("removed").is_none());
+    let state: toml::Value =
+        toml::from_str(&fs::read_to_string(f.project.join(".typm/state.toml")).unwrap()).unwrap();
+    for link in state["links"].as_array().unwrap() {
+        let path = link["path"].as_str().unwrap();
+        let root = if path == "local/shared/1.0.0" || path == "local/keeper/1.0.0" {
+            "keeper"
+        } else {
+            "local"
+        };
+        assert_eq!(
+            link["roots"].as_array().unwrap(),
+            &vec![toml::Value::String(root.into())]
+        );
+    }
+}
+
+#[test]
+fn commands_preserve_project_and_skip_typst_when_manual_edits_fail_resolution() {
+    let f = Fixture::new();
+    let existing = f.repo("existing");
+    package(&existing.path, "existing", "1.0.0");
+    existing.commit();
+    f.local("removed");
+    let added = f.local("added");
+    let valid = format!(
+        "{}\nremoved = {{ path = '../local/removed' }}",
+        git_dependency("existing", &existing)
+    );
+    dependencies(&f.project, &valid);
+    f.ok(&["sync"]);
+    let lock = fs::read(f.project.join("typm.lock")).unwrap();
+    let state = fs::read(f.project.join(".typm/state.toml")).unwrap();
+    let links =
+        ["existing", "removed"].map(|name| (name, fs::read_link(f.link(name, "1.0.0")).unwrap()));
+    dependencies(
+        &f.project,
+        &format!("{valid}\nzmissing = {{ path = '../missing' }}"),
+    );
+    let manifest = fs::read(f.project.join("typm.toml")).unwrap();
+
+    for command in [
+        "add", "remove", "rm", "sync", "update", "compile", "watch", "query", "fonts",
+    ] {
+        let output = match command {
+            "add" => f.run(&[command, "--path", added.to_str().unwrap()]),
+            "remove" | "rm" => f.run(&[command, "removed"]),
+            "compile" | "watch" => f.run(&[command, "main.typ"]),
+            "query" => f.run(&[command, "main.typ", "<target>"]),
+            _ => f.run(&[command]),
+        };
+        let error = failure(output);
+        assert!(error.contains("zmissing"));
+        assert!(error.contains("cannot locate path dependency"));
+        assert_eq!(fs::read(f.project.join("typm.toml")).unwrap(), manifest);
+        assert_eq!(fs::read(f.project.join("typm.lock")).unwrap(), lock);
+        assert_eq!(fs::read(f.project.join(".typm/state.toml")).unwrap(), state);
+        for (name, target) in &links {
+            assert_eq!(fs::read_link(f.link(name, "1.0.0")).unwrap(), *target);
+        }
+        f.assert_packages(
+            &[("existing", "1.0.0"), ("removed", "1.0.0")],
+            &[("existing", "1.0.0")],
+        );
+        assert!(fs::symlink_metadata(f.link("added", "1.0.0")).is_err());
+        assert!(
+            !f.log.exists(),
+            "{command} must not invoke Typst after failed resolution"
+        );
+    }
 }
 
 #[test]

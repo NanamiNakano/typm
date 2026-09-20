@@ -5,7 +5,7 @@ use crate::files::read_optional;
 use crate::git::GitSourceSpec;
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, whatever};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,26 +81,6 @@ impl Lockfile {
             }
         }
         Ok(())
-    }
-
-    pub fn remove_roots(&mut self, names: &BTreeSet<String>) {
-        self.roots.retain(|name, _| !names.contains(name));
-        let mut pending: Vec<_> = self.roots.values().flatten().cloned().collect();
-        let mut reachable = BTreeSet::new();
-        while let Some(id) = pending.pop() {
-            if reachable.insert(id.clone())
-                && let Some(package) = self.packages.get(&id)
-            {
-                pending.extend(package.dependencies.iter().cloned());
-            }
-        }
-        self.packages.retain(|id, _| reachable.contains(id));
-        let retained_sources: BTreeSet<_> = self
-            .packages
-            .values()
-            .map(|package| package.source.clone())
-            .collect();
-        self.sources.retain(|id, _| retained_sources.contains(id));
     }
 }
 

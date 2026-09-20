@@ -44,13 +44,11 @@ pub fn add(context: &Context, project: &Project, options: AddOptions) -> Result<
     let mut resolver = Resolver::new(context, previous_lockfile, refresh);
     let name = resolver.infer_name(&dependency, &project.root, name)?;
     document.insert(&name, dependency)?;
-    let resolution = resolver.resolve(&document.manifest, &project.root)?;
-    project.update(&resolution.lock, &resolution.links, Some(&document.text()))?;
+    let count = reconcile_packages(project, &document, resolver, true)?;
 
-    context.shell.status(
-        "Added",
-        &format!("{name} ({} packages linked)", resolution.links.len()),
-    );
+    context
+        .shell
+        .status("Added", &format!("{name} ({count} packages linked)"));
     Ok(0)
 }
 
@@ -77,28 +75,14 @@ fn prepare_dependency(
 pub fn remove(context: &Context, project: &Project, options: RemoveOptions) -> Result<i32> {
     let _guard = project.acquire()?;
     let mut document = ManifestDocument::read(&project.manifest_path)?;
-    let mut lockfile = lockfile::read(&project.root.join("typm.lock"))?;
+    let previous_lockfile = lockfile::read(&project.root.join("typm.lock"))?;
     let names: BTreeSet<_> = options.names.into_iter().collect();
     for name in &names {
         document.remove(name)?;
     }
 
-    let mut removed_roots = names.clone();
-    removed_roots.extend(
-        lockfile
-            .roots
-            .keys()
-            .filter(|name| !document.manifest.dependencies.contains_key(*name))
-            .cloned(),
-    );
-    lockfile.remove_roots(&removed_roots);
-    let mut links = project.read_links()?.links;
-    for link in &mut links {
-        link.roots
-            .retain(|name| document.manifest.dependencies.contains_key(name));
-    }
-    links.retain(|link| !link.roots.is_empty());
-    project.update(&lockfile, &links, Some(&document.text()))?;
+    let resolver = Resolver::new(context, previous_lockfile, RefreshPolicy::Preserve);
+    reconcile_packages(project, &document, resolver, true)?;
 
     context
         .shell
@@ -141,8 +125,19 @@ fn prepare_packages(context: &Context, project: &Project, refresh: RefreshPolicy
     let _guard = project.acquire()?;
     let document = ManifestDocument::read_required(&project.manifest_path)?;
     let previous_lockfile = lockfile::read(&project.root.join("typm.lock"))?;
-    let resolution = Resolver::new(context, previous_lockfile, refresh)
-        .resolve(&document.manifest, &project.root)?;
-    project.update(&resolution.lock, &resolution.links, None)?;
+    let resolver = Resolver::new(context, previous_lockfile, refresh);
+    reconcile_packages(project, &document, resolver, false)
+}
+
+/// Resolve and commit the current manifest while the caller holds the project lock.
+fn reconcile_packages(
+    project: &Project,
+    document: &ManifestDocument,
+    resolver: Resolver<'_>,
+    write_manifest: bool,
+) -> Result<usize> {
+    let resolution = resolver.resolve(&document.manifest, &project.root)?;
+    let manifest = write_manifest.then(|| document.text());
+    project.update(&resolution.lock, &resolution.links, manifest.as_deref())?;
     Ok(resolution.links.len())
 }
