@@ -1,0 +1,27 @@
+[package]
+name = "typst-args"
+version = "0.15.1"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.92"
+authors = ["The Typst Project Developers"]
+include = [
+    "../vendor/typst/crates/typst-cli/src/args.rs"
+]
+
+[lib]
+path = "../vendor/typst/crates/typst-cli/src/args.rs"
+
+[dependencies]
+clap = { version = "4.4", features = ["derive", "env", "wrap_help", "string"] }
+clap_complete = "4.2.1"
+color-print = "0.3.6"
+semver = "1"
+serde = { version = "1.0.184", features = ["derive"] }
+typst-utils.workspace = true
+
+[features]
+default = ["embedded-fonts", "http-server"]
+embedded-fonts = []
+http-server = []
+self-update = []

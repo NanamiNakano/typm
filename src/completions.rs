@@ -8,11 +8,6 @@ use snafu::ResultExt;
 use crate::Result;
 use crate::cli::Args;
 
-#[allow(dead_code)]
-#[rustfmt::skip]
-#[path = "typst_args.rs"]
-mod typst_args;
-
 /// This tree is only for completion generation; execution must keep forwarding
 /// Typst arguments unchanged, including options unknown to the bundled schema.
 fn command() -> Command {

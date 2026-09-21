@@ -1224,10 +1224,22 @@ dependencies = [
  "tempfile",
  "toml 1.1.6+spec-1.1.0",
  "toml_edit 0.25.15+spec-1.1.0",
+ "typst-args",
  "typst-syntax",
- "typst-utils",
  "url",
  "walkdir",
+]
+
+[[package]]
+name = "typst-args"
+version = "0.15.1"
+dependencies = [
+ "clap",
+ "clap_complete",
+ "color-print",
+ "semver",
+ "serde",
+ "typst-utils",
 ]
 
 [[package]]

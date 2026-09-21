@@ -1,14 +1,21 @@
+[workspace]
+members = ["typst-args"]
+
+[workspace.dependencies]
+typst-syntax = "0.15.1"
+typst-utils = "=0.15.1"
+typst-args = { path = "typst-args" }
+
 [package]
 name = "typm"
 version = "0.1.2"
 edition = "2024"
 description = "An experimental package manager for typst"
-license = "MIT AND Apache-2.0"
+license = "MIT"
 homepage = "https://github.com/NanamiNakano/typm"
 repository = "https://github.com/NanamiNakano/typm"
 readme = "README.md"
 include = [
-    "/build.rs",
     "/src/**",
     "/tests/**",
     "/README.md",
@@ -16,8 +23,6 @@ include = [
     "/LICENSE-APACHE",
 ]
 
-# These features enable optional definitions in the upstream CLI schema only.
-# Typst itself is still a separate executable.
 [features]
 default = ["embedded-fonts", "http-server", "self-update"]
 embedded-fonts = []
@@ -45,7 +50,7 @@ snafu = "0.9.2"
 tempfile = "3.27.0"
 toml = "1.1.6"
 toml_edit = "0.25.15"
-typst-syntax = "0.15.1"
-typst-utils = "=0.15.1"
+typst-syntax.workspace = true
+typst-args.workspace = true
 url = "2.5.8"
 walkdir = "2.5.0"
