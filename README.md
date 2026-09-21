@@ -4,12 +4,6 @@
 
 ## Install
 
-### Cargo
-
-```shell
-cargo install typm
-```
-
 ### Build from Source
 
 ```shell
