@@ -1,6 +1,6 @@
 [package]
 name = "typm"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "An experimental package manager for typst"
 license = "MIT AND Apache-2.0"
@@ -8,12 +8,12 @@ homepage = "https://github.com/NanamiNakano/typm"
 repository = "https://github.com/NanamiNakano/typm"
 readme = "README.md"
 include = [
+    "/build.rs",
     "/src/**",
     "/tests/**",
-    "/vendor/typst/crates/typst-cli/src/args.rs",
-    "/vendor/typst/LICENSE",
     "/README.md",
     "/LICENSE",
+    "/LICENSE-APACHE",
 ]
 
 # These features enable optional definitions in the upstream CLI schema only.
