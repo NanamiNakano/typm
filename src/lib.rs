@@ -1,5 +1,6 @@
 pub mod cli;
 mod commands;
+mod completions;
 mod context;
 mod files;
 mod git;

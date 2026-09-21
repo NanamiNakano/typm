@@ -1,4 +1,4 @@
-use clap::{ArgGroup, Parser, Subcommand};
+use clap::{ArgGroup, Parser, Subcommand, ValueHint};
 use std::ffi::OsString;
 use std::path::PathBuf;
 
@@ -10,7 +10,7 @@ use std::path::PathBuf;
 )]
 pub struct Args {
     /// Use a specific typm.toml instead of searching parent directories.
-    #[arg(long, value_name = "FILE")]
+    #[arg(long, value_name = "FILE", value_hint = ValueHint::FilePath)]
     pub manifest_path: Option<PathBuf>,
     /// Suppress typm status and Git progress (Typst output is unchanged).
     #[arg(short, long)]
@@ -29,7 +29,7 @@ pub enum Command {
         name: Option<String>,
         #[arg(long, value_name = "URL")]
         git: Option<String>,
-        #[arg(long, value_name = "DIR")]
+        #[arg(long, value_name = "DIR", value_hint = ValueHint::DirPath)]
         path: Option<PathBuf>,
         #[arg(long, requires = "git")]
         branch: Option<String>,
@@ -50,6 +50,11 @@ pub enum Command {
     Sync,
     /// Update all Git dependencies within their declared refs and refresh package links.
     Update,
+    /// Generate shell completions for typm and its wrapped Typst commands.
+    Completions {
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
     #[command(external_subcommand)]
     Typst(Vec<OsString>),
 }
