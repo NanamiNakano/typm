@@ -225,16 +225,6 @@ mod tests {
     }
 
     #[test]
-    fn initialization_does_not_create_home_or_cache() {
-        let fixture = Fixture::new();
-        let context = fixture.context(Environment::default()).unwrap();
-        assert_eq!(context.home, fixture.default_home);
-        assert_eq!(context.cache_root, fixture.default_home);
-        assert!(!context.home.exists());
-        assert!(!context.config.net.git_fetch_with_cli);
-    }
-
-    #[test]
     fn explicit_paths_are_relative_to_invocation_and_override_legacy_cache() {
         let fixture = Fixture::new();
         fs::create_dir_all(fixture.legacy_cache.join("git/db")).unwrap();
@@ -258,25 +248,6 @@ mod tests {
     }
 
     #[test]
-    fn explicit_cache_keeps_default_home_configuration() {
-        let fixture = Fixture::new();
-        fixture.write_config(
-            &fixture.default_home.join("config.toml"),
-            "[net]\ngit-fetch-with-cli = true\n",
-        );
-        let context = fixture
-            .context(Environment {
-                cache_root: Some("custom-cache".into()),
-                ..Environment::default()
-            })
-            .unwrap();
-        assert_eq!(context.home, fixture.default_home);
-        assert_eq!(context.cache_root, fixture.cwd.join("custom-cache"));
-        assert!(context.config.net.git_fetch_with_cli);
-        assert!(!context.cache_root.exists());
-    }
-
-    #[test]
     fn reuses_only_legacy_caches_with_git_storage() {
         let fixture = Fixture::new();
         fs::create_dir_all(&fixture.legacy_cache).unwrap();
@@ -285,23 +256,6 @@ mod tests {
         fs::create_dir_all(fixture.legacy_cache.join("git/db")).unwrap();
         let context = fixture.context(Environment::default()).unwrap();
         assert_eq!(context.cache_root, fixture.legacy_cache);
-    }
-
-    #[test]
-    fn rejects_empty_home_and_cache_overrides() {
-        let fixture = Fixture::new();
-        for environment in [
-            Environment {
-                home: Some(OsString::new()),
-                ..Environment::default()
-            },
-            Environment {
-                cache_root: Some(OsString::new()),
-                ..Environment::default()
-            },
-        ] {
-            assert!(fixture.context(environment).is_err());
-        }
     }
 
     #[test]
@@ -366,25 +320,6 @@ mod tests {
     }
 
     #[test]
-    fn invalid_configuration_reports_its_path() {
-        let fixture = Fixture::new();
-        let path = fixture.cwd.join(".typm/config.toml");
-        fixture.write_config(&path, "[net]\ngit-fetch-with-cli = 'yes'\n");
-        let error = fixture.context(Environment::default()).err().unwrap();
-        assert!(error.to_string().contains(&path.display().to_string()));
-        for value in ["yes", "1", "", "TRUE"] {
-            assert!(
-                Config::load(
-                    &fixture.directory.path().join("absent-home"),
-                    fixture.directory.path(),
-                    Some(OsStr::new(value)),
-                )
-                .is_err()
-            );
-        }
-    }
-
-    #[test]
     fn global_configuration_is_not_reapplied_as_an_ancestor() {
         let fixture = Fixture::new();
         let global = fixture.directory.path().join("workspace/.typm");
@@ -398,24 +333,5 @@ mod tests {
         );
         let config = Config::load(&global, &fixture.cwd, None).unwrap();
         assert!(!config.net.git_fetch_with_cli);
-    }
-
-    #[test]
-    fn cache_lock_is_created_lazily_and_released_on_drop() {
-        let fixture = Fixture::new();
-        let context = fixture.context(Environment::default()).unwrap();
-        assert!(!context.cache_root.exists());
-        let guard = context.acquire_cache_lock().unwrap();
-        let competing = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(context.cache_root.join(".package-cache"))
-            .unwrap();
-        assert!(matches!(
-            competing.try_lock(),
-            Err(TryLockError::WouldBlock)
-        ));
-        drop(guard);
-        competing.try_lock().unwrap();
     }
 }

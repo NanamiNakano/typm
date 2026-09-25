@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use snafu::{ResultExt, whatever};
 
@@ -9,9 +9,9 @@ use crate::context::Context;
 use crate::files::read_optional;
 use crate::lockfile;
 use crate::manifest::{Dependency, ManifestDocument};
-use crate::project::Project;
-use crate::resolver::{self, Resolver};
-use crate::sources::RefreshPolicy;
+use crate::project::{ManagedLink, Project};
+use crate::resolver::Resolver;
+use crate::sources::{RefreshPolicy, normalize_git_location};
 use crate::typst;
 
 pub struct AddOptions {
@@ -60,7 +60,7 @@ fn prepare_dependency(
     let cwd = &context.cwd;
     dependency.git = dependency
         .git
-        .map(|location| resolver::normalize_git_location(&location, cwd))
+        .map(|location| normalize_git_location(&location, cwd))
         .transpose()?;
     if let Some(path) = dependency.path {
         let absolute = cwd
@@ -137,7 +137,22 @@ fn reconcile_packages(
     write_manifest: bool,
 ) -> Result<usize> {
     let resolution = resolver.resolve(&document.manifest, &project.root)?;
+    let mut links = Vec::new();
+    for import in resolution.imports {
+        let target = if import.version == import.package.version {
+            import.package.root
+        } else {
+            crate::stubs::prepare(&project.root.join(".typm"), &import.package.root)?
+        };
+        links.push(ManagedLink {
+            path: PathBuf::from(import.namespace)
+                .join(import.package.name)
+                .join(import.version),
+            target,
+            roots: import.roots,
+        });
+    }
     let manifest = write_manifest.then(|| document.text());
-    project.update(&resolution.lock, &resolution.links, manifest.as_deref())?;
-    Ok(resolution.links.len())
+    project.update(&resolution.lock, &links, manifest.as_deref())?;
+    Ok(links.len())
 }

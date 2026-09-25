@@ -37,7 +37,7 @@ pub enum Command {
         tag: Option<String>,
         #[arg(long, requires = "git")]
         rev: Option<String>,
-        #[arg(long, default_value = "local")]
+        #[arg(long, default_value = "typm")]
         namespace: String,
     },
     /// Remove direct dependencies and their unused transitive package links.

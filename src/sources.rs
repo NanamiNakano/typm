@@ -43,27 +43,12 @@ pub struct PackagePin {
 }
 
 enum PackageRequest<'a> {
-    Discover {
-        expected: Option<&'a str>,
-        namespace: &'a str,
-    },
-    Path {
-        path: &'a Path,
-        base: &'a Path,
-        namespace: &'a str,
-    },
-}
-
-impl PackageRequest<'_> {
-    fn namespace(&self) -> &str {
-        match self {
-            Self::Discover { namespace, .. } | Self::Path { namespace, .. } => namespace,
-        }
-    }
+    Discover(Option<&'a str>),
+    Path { path: &'a Path, base: &'a Path },
 }
 
 trait Source {
-    fn package(&self, request: PackageRequest<'_>) -> Result<Package>;
+    fn package(&self, request: PackageRequest<'_>, namespace: &str) -> Result<Package>;
     fn manifest(&self, package_root: &Path) -> Result<ManifestDocument>;
     fn identity(&self, package: &Package) -> Result<PackageIdentity>;
 }
@@ -74,17 +59,12 @@ struct GitSource {
 }
 
 impl Source for GitSource {
-    fn package(&self, request: PackageRequest<'_>) -> Result<Package> {
+    fn package(&self, request: PackageRequest<'_>, namespace: &str) -> Result<Package> {
         match request {
-            PackageRequest::Discover {
-                expected,
-                namespace,
-            } => package::discover(&self.checkout.root, expected, namespace),
-            PackageRequest::Path {
-                path,
-                base,
-                namespace,
-            } => {
+            PackageRequest::Discover(expected) => {
+                package::discover(&self.checkout.root, expected, namespace)
+            }
+            PackageRequest::Path { path, base } => {
                 if path.is_absolute() {
                     whatever!(
                         "Git package declares an absolute local dependency path `{}`; use a relative path inside the repository or a Git dependency",
@@ -153,8 +133,8 @@ struct PathSource {
 }
 
 impl Source for PathSource {
-    fn package(&self, request: PackageRequest<'_>) -> Result<Package> {
-        package::read(&self.root, request.namespace())
+    fn package(&self, _request: PackageRequest<'_>, namespace: &str) -> Result<Package> {
+        package::read(&self.root, namespace)
     }
 
     fn manifest(&self, package_root: &Path) -> Result<ManifestDocument> {
@@ -223,36 +203,19 @@ impl<'context> SourceMap<'context> {
         let (source, request) = if let Some(mut specification) = dependency.git_source() {
             specification.git = normalize_git_location(&specification.git, base)?;
             let source = self.load_git(specification)?;
-            (
-                source,
-                PackageRequest::Discover {
-                    expected,
-                    namespace: &dependency.namespace,
-                },
-            )
+            (source, PackageRequest::Discover(expected))
         } else {
             let path = dependency.path.as_ref().expect("validated path source");
             if let Some(source @ SourceId::Git(_)) = parent {
-                (
-                    source.clone(),
-                    PackageRequest::Path {
-                        path,
-                        base,
-                        namespace: &dependency.namespace,
-                    },
-                )
+                (source.clone(), PackageRequest::Path { path, base })
             } else {
                 let source = self.load_path(resolve_dependency_path(path, base)?);
-                (
-                    source,
-                    PackageRequest::Discover {
-                        expected,
-                        namespace: &dependency.namespace,
-                    },
-                )
+                (source, PackageRequest::Discover(expected))
             }
         };
-        let package = self.provider(&source).package(request)?;
+        let package = self
+            .provider(&source)
+            .package(request, &dependency.namespace)?;
         if let Some(expected) = expected
             && package.name != expected
         {

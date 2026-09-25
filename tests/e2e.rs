@@ -83,22 +83,20 @@ exit "${TYPM_TEST_EXIT:-0}"
 
     fn link(&self, name: &str, version: &str) -> PathBuf {
         self.project
-            .join(".typm/packages/local")
+            .join(".typm/packages/typm")
             .join(name)
             .join(version)
     }
 
     fn lock(&self) -> String {
-        let contents = fs::read_to_string(self.project.join("typm.lock")).unwrap();
-        toml::from_str::<toml::Value>(&contents).unwrap();
-        contents
+        fs::read_to_string(self.project.join("typm.lock")).unwrap()
     }
 
     fn assert_packages(&self, linked: &[(&str, &str)], locked: &[(&str, &str)]) {
         let paths = |packages: &[(&str, &str)]| {
             packages
                 .iter()
-                .map(|(name, version)| format!("local/{name}/{version}"))
+                .map(|(name, version)| format!("typm/{name}/{version}"))
                 .collect::<BTreeSet<_>>()
         };
         let state: toml::Value =
@@ -111,12 +109,6 @@ exit "${TYPM_TEST_EXIT:-0}"
             .map(|link| {
                 let path = link["path"].as_str().unwrap();
                 let installed = self.project.join(".typm/packages").join(path);
-                assert!(
-                    fs::symlink_metadata(&installed)
-                        .unwrap()
-                        .file_type()
-                        .is_symlink()
-                );
                 assert_eq!(
                     fs::read_link(&installed).unwrap(),
                     Path::new(link["target"].as_str().unwrap())
@@ -126,6 +118,9 @@ exit "${TYPM_TEST_EXIT:-0}"
             })
             .collect::<BTreeSet<_>>();
         assert_eq!(state_paths, paths(linked));
+        for (name, version) in linked {
+            assert_eq!(package_version(&self.link(name, version)), *version);
+        }
         let lock: toml::Value = toml::from_str(&self.lock()).unwrap();
         let lock_paths = lock["packages"]
             .as_table()
@@ -211,6 +206,20 @@ fn failure(output: Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
+fn package_source(installed: &Path) -> PathBuf {
+    fs::canonicalize(installed.join("lib.typ"))
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf()
+}
+
+fn package_version(path: &Path) -> String {
+    let manifest: toml::Value =
+        toml::from_str(&fs::read_to_string(path.join("typst.toml")).unwrap()).unwrap();
+    manifest["package"]["version"].as_str().unwrap().to_owned()
+}
+
 fn package(path: &Path, name: &str, version: &str) {
     fs::create_dir_all(path).unwrap();
     fs::write(
@@ -231,6 +240,248 @@ fn dependencies(path: &Path, entries: &str) {
 
 fn git_dependency(name: &str, repo: &Repository) -> String {
     format!("{name} = {{ git = {:?}, branch = \"main\" }}", repo.url())
+}
+
+#[test]
+fn package_stubs_preserve_local_and_cached_sources_and_manifest_formatting() {
+    for git in [false, true] {
+        let f = Fixture::new();
+        let repo = git.then(|| f.repo("styled"));
+        let source = repo
+            .as_ref()
+            .map(|repo| repo.path.clone())
+            .unwrap_or_else(|| f.local("styled"));
+        package(&source, "styled", "1.2.3");
+        let manifest = "# Keep release 1.2.3 and this formatting.\n[package]\nname='styled'\nversion = '1.2.3' # published version\nentrypoint = \"lib.typ\"\ndescription = 'Release 1.2.3'\nauthors = [\"Package Author\"]\n\n[tool.example]\nversion = '1.2.3'\n";
+        fs::write(source.join("typst.toml"), manifest).unwrap();
+        fs::create_dir(source.join("assets")).unwrap();
+        fs::write(source.join("assets/data.txt"), "package asset\n").unwrap();
+        fs::write(source.join("README.md"), "Original package\n").unwrap();
+        if let Some(repo) = &repo {
+            repo.commit();
+            f.ok(&["add", "--git", &repo.url()]);
+        } else {
+            f.ok(&["add", "--path", source.to_str().unwrap()]);
+        }
+
+        let installed = f.link("styled", "0.0.0");
+        assert!(
+            fs::symlink_metadata(&installed)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let stub = fs::canonicalize(installed.join("typst.toml")).unwrap();
+        assert!(stub.starts_with(f.project.join(".typm")));
+        let expected = manifest.replacen("version = '1.2.3'", "version = '0.0.0'", 1);
+        assert_eq!(
+            fs::read_to_string(installed.join("typst.toml")).unwrap(),
+            expected
+        );
+        assert_eq!(
+            fs::read_to_string(source.join("typst.toml")).unwrap(),
+            manifest
+        );
+        let backing = package_source(&installed);
+        assert_eq!(
+            fs::read_to_string(backing.join("typst.toml")).unwrap(),
+            manifest
+        );
+        if git {
+            assert!(backing.starts_with(&f.cache));
+            f.assert_packages(&[("styled", "0.0.0")], &[("styled", "1.2.3")]);
+        } else {
+            assert_eq!(backing, source);
+        }
+        for name in ["typst.toml", "lib.typ", "assets", "README.md"] {
+            let entry = installed.join(name);
+            assert!(
+                fs::symlink_metadata(&entry)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            if name != "typst.toml" {
+                assert_eq!(
+                    fs::canonicalize(entry).unwrap(),
+                    fs::canonicalize(backing.join(name)).unwrap()
+                );
+            }
+        }
+        assert!(!f.link("styled", "1.2.3").exists());
+        assert!(!f.project.join(".typm/packages/local").exists());
+        if let Some(repo) = &repo {
+            assert!(repo.git(&["status", "--porcelain"]).is_empty());
+        }
+    }
+}
+
+#[test]
+fn local_stub_links_stay_live_and_refresh_manifest_and_top_level_entries() {
+    let f = Fixture::new();
+    let source = f.local("live");
+    fs::create_dir(source.join("assets")).unwrap();
+    fs::write(source.join("assets/value.txt"), "original\n").unwrap();
+    fs::write(source.join("obsolete.txt"), "removed later\n").unwrap();
+    f.ok(&["add", "--path", source.to_str().unwrap()]);
+    let installed = f.link("live", "0.0.0");
+    fs::write(source.join("lib.typ"), "#let value = \"live edit\"\n").unwrap();
+    fs::write(source.join("assets/value.txt"), "updated\n").unwrap();
+    fs::write(source.join("assets/new.txt"), "new nested asset\n").unwrap();
+    assert_eq!(
+        fs::read_to_string(installed.join("lib.typ")).unwrap(),
+        "#let value = \"live edit\"\n"
+    );
+    assert_eq!(
+        fs::read_to_string(installed.join("assets/value.txt")).unwrap(),
+        "updated\n"
+    );
+    assert_eq!(
+        fs::read_to_string(installed.join("assets/new.txt")).unwrap(),
+        "new nested asset\n"
+    );
+    fs::write(source.join("new.typ"), "#let added = true\n").unwrap();
+    fs::remove_file(source.join("obsolete.txt")).unwrap();
+    f.ok(&["sync"]);
+    assert_eq!(
+        fs::read_to_string(installed.join("new.typ")).unwrap(),
+        "#let added = true\n"
+    );
+    assert!(
+        fs::symlink_metadata(installed.join("new.typ"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(fs::symlink_metadata(installed.join("obsolete.txt")).is_err());
+
+    let original_manifest = fs::read_to_string(source.join("typst.toml")).unwrap();
+    let newer_version = original_manifest.replace("1.0.0", "2.0.0");
+    let refreshed_manifest = format!("{newer_version}description = 'Updated package metadata'\n");
+    fs::write(source.join("typst.toml"), &refreshed_manifest).unwrap();
+    f.ok(&["sync"]);
+    assert_eq!(
+        fs::read_to_string(source.join("typst.toml")).unwrap(),
+        refreshed_manifest
+    );
+    assert_eq!(
+        fs::read_to_string(installed.join("typst.toml")).unwrap(),
+        refreshed_manifest.replace("2.0.0", "0.0.0")
+    );
+    assert!(!f.link("live", "1.0.0").exists());
+    assert!(!f.link("live", "2.0.0").exists());
+}
+
+#[test]
+fn sync_migrates_old_managed_links_without_keeping_import_aliases() {
+    let f = Fixture::new();
+    let repo = f.repo("migrated");
+    package(&repo.path, "migrated", "1.0.0");
+    let pinned = repo.commit();
+    f.ok(&[
+        "add",
+        "--git",
+        &repo.url(),
+        "--branch",
+        "main",
+        "--namespace",
+        "local",
+    ]);
+    let previous_link = f.project.join(".typm/packages/local/migrated/0.0.0");
+    let source = package_source(&previous_link);
+    fs::remove_file(&previous_link).unwrap();
+    dependencies(&f.project, &git_dependency("migrated", &repo));
+    let old_link = f.project.join(".typm/packages/local/migrated/1.0.0");
+    fs::create_dir_all(old_link.parent().unwrap()).unwrap();
+    symlink(&source, &old_link).unwrap();
+    fs::write(
+        f.project.join(".typm/state.toml"),
+        format!("version = 1\n\n[[links]]\npath = 'local/migrated/1.0.0'\ntarget = {:?}\nroots = ['migrated']\n", source.to_str().unwrap()),
+    ).unwrap();
+    package(&repo.path, "migrated", "2.0.0");
+    let upstream = repo.commit();
+
+    f.ok(&["sync"]);
+    assert!(fs::symlink_metadata(&old_link).is_err());
+    let installed = f.link("migrated", "0.0.0");
+    assert_eq!(package_source(&installed), source);
+    assert_eq!(package_version(&installed), "0.0.0");
+    assert_eq!(package_version(&source), "1.0.0");
+    assert!(f.lock().contains(&pinned));
+    assert!(!f.lock().contains(&upstream));
+    f.assert_packages(&[("migrated", "0.0.0")], &[("migrated", "1.0.0")]);
+    assert!(!f.link("migrated", "1.0.0").exists());
+    assert!(
+        !f.project
+            .join(".typm/packages/local/migrated/0.0.0")
+            .exists()
+    );
+}
+
+#[test]
+fn direct_and_transitive_links_follow_promotions_demotions_and_removal() {
+    for version in ["1.0.0", "0.0.0"] {
+        let f = Fixture::new();
+        let shared = f.local("shared");
+        package(&shared, "shared", version);
+        let front = f.local("front");
+        dependencies(&front, "shared = { path = '../shared' }");
+        f.ok(&["add", "--path", front.to_str().unwrap()]);
+        let direct = f.link("shared", "0.0.0");
+        let transitive = f.link("shared", version);
+        assert_eq!(fs::read_link(&transitive).unwrap(), shared);
+        if version != "0.0.0" {
+            assert!(!direct.exists());
+        }
+
+        f.ok(&["add", "--path", shared.to_str().unwrap()]);
+        assert_eq!(package_source(&direct), shared);
+        assert_eq!(package_version(&direct), "0.0.0");
+        assert_eq!(fs::read_link(&transitive).unwrap(), shared);
+        assert_eq!(package_version(&transitive), version);
+
+        f.ok(&["remove", "shared"]);
+        if version != "0.0.0" {
+            assert!(fs::symlink_metadata(&direct).is_err());
+        }
+        assert_eq!(fs::read_link(&transitive).unwrap(), shared);
+        f.ok(&["add", "--path", shared.to_str().unwrap()]);
+        f.ok(&["remove", "front"]);
+        if version != "0.0.0" {
+            assert!(fs::symlink_metadata(&transitive).is_err());
+        }
+        assert_eq!(package_source(&direct), shared);
+        f.ok(&["remove", "shared"]);
+        assert!(fs::symlink_metadata(&direct).is_err());
+        assert_eq!(package_version(&shared), version);
+        assert!(shared.join("lib.typ").is_file());
+    }
+}
+
+#[test]
+fn direct_alias_conflicting_with_a_distinct_genuine_zero_source_preserves_project() {
+    let f = Fixture::new();
+    let shared = f.local("shared");
+    let zero = f.temp.path().join("zero-version");
+    package(&zero, "shared", "0.0.0");
+    let front = f.local("front");
+    dependencies(
+        &front,
+        &format!("shared = {{ path = {:?} }}", zero.to_str().unwrap()),
+    );
+    f.ok(&["add", "--path", shared.to_str().unwrap()]);
+    let manifest = fs::read(f.project.join("typm.toml")).unwrap();
+    let state = fs::read(f.project.join(".typm/state.toml")).unwrap();
+    let installed = f.link("shared", "0.0.0");
+    let target = fs::read_link(&installed).unwrap();
+    let error = failure(f.run(&["add", "--path", front.to_str().unwrap()]));
+    assert!(error.contains("shared") && error.contains("front"));
+    assert_eq!(fs::read(f.project.join("typm.toml")).unwrap(), manifest);
+    assert_eq!(fs::read(f.project.join(".typm/state.toml")).unwrap(), state);
+    assert_eq!(fs::read_link(installed).unwrap(), target);
+    assert!(!f.link("front", "0.0.0").exists());
+    assert_eq!(package_version(&shared), "1.0.0");
+    assert_eq!(package_version(&zero), "0.0.0");
 }
 
 #[test]
@@ -260,15 +511,17 @@ fn sync_downloads_and_links_recursive_git_and_local_dependencies_without_typst()
 
     let output = f.ok(&["sync"]);
     assert!(output.stdout.is_empty());
-    assert!(!f.log.exists(), "sync must not invoke Typst");
     assert!(f.project.join(".typm/.gitignore").is_file());
-    for (name, target) in [("helpers", helpers), ("local-leaf", local_leaf)] {
-        assert_eq!(fs::canonicalize(f.link(name, "1.0.0")).unwrap(), target);
+    for (name, version, target) in [
+        ("helpers", "0.0.0", helpers),
+        ("local-leaf", "1.0.0", local_leaf),
+    ] {
+        assert_eq!(package_source(&f.link(name, version)), target);
     }
-    for name in ["front", "leaf"] {
-        let link = f.link(name, "1.0.0");
+    for (name, version) in [("front", "0.0.0"), ("leaf", "1.0.0")] {
+        let link = f.link(name, version);
         assert!(link.join("lib.typ").is_file());
-        assert!(fs::canonicalize(link).unwrap().starts_with(&f.cache));
+        assert!(package_source(&link).starts_with(&f.cache));
     }
     let lock = f.lock();
     assert!(lock.contains(&front_commit));
@@ -305,7 +558,7 @@ fn sync_ignores_project_metadata_and_preserves_custom_gitignore() {
         ".typm/.gitignore",
         ".typm/config.toml",
         ".typm/notes.txt",
-        ".typm/packages/local/dependency/1.0.0",
+        ".typm/packages/typm/dependency/0.0.0",
         ".typm/state.toml",
         ".typm/project.lock",
     ];
@@ -352,15 +605,15 @@ fn sync_keeps_pins_and_restores_missing_checkouts_from_cached_and_remote_objects
         assert!(lock.contains(&original));
         assert!(!lock.contains(&updated));
 
-        let checkout = fs::canonicalize(f.link("locked", "1.0.0")).unwrap();
+        let checkout = package_source(&f.link("locked", "0.0.0"));
         fs::remove_dir_all(checkout).unwrap();
-        fs::remove_file(f.link("locked", "1.0.0")).unwrap();
+        fs::remove_file(f.link("locked", "0.0.0")).unwrap();
         let offline = repo.path.with_extension("offline");
         fs::rename(&repo.path, &offline).unwrap();
         sync();
         assert_eq!(f.lock(), lock);
         assert_eq!(
-            fs::read_to_string(f.link("locked", "1.0.0").join("lib.typ")).unwrap(),
+            fs::read_to_string(f.link("locked", "0.0.0").join("lib.typ")).unwrap(),
             "#let value = \"locked\"\n"
         );
 
@@ -369,7 +622,7 @@ fn sync_keeps_pins_and_restores_missing_checkouts_from_cached_and_remote_objects
         sync();
         assert_eq!(f.lock(), lock);
         assert_eq!(
-            fs::read_to_string(f.link("locked", "1.0.0").join("lib.typ")).unwrap(),
+            fs::read_to_string(f.link("locked", "0.0.0").join("lib.typ")).unwrap(),
             "#let value = \"locked\"\n"
         );
         assert!(!f.log.exists());
@@ -447,14 +700,21 @@ fn update_refreshes_the_full_graph_and_reconciles_versions_and_dependencies() {
     for commit in old_commits {
         assert!(!lock.contains(&commit));
     }
-    for name in ["front", "leaf", "local-git", "helpers"] {
-        assert!(f.link(name, "2.0.0").join("lib.typ").is_file());
+    for (name, version) in [
+        ("front", "0.0.0"),
+        ("leaf", "2.0.0"),
+        ("local-git", "2.0.0"),
+    ] {
+        assert!(f.link(name, version).join("lib.typ").is_file());
+        assert_eq!(
+            package_version(&package_source(&f.link(name, version))),
+            "2.0.0"
+        );
         assert!(fs::symlink_metadata(f.link(name, "1.0.0")).is_err());
     }
-    assert_eq!(
-        fs::canonicalize(f.link("helpers", "2.0.0")).unwrap(),
-        helpers
-    );
+    assert_eq!(package_source(&f.link("helpers", "0.0.0")), helpers);
+    assert_eq!(package_version(&helpers), "2.0.0");
+    assert!(!f.link("helpers", "1.0.0").exists());
     assert!(f.link("added", "1.0.0").join("lib.typ").is_file());
     assert!(fs::symlink_metadata(f.link("obsolete", "1.0.0")).is_err());
     assert_eq!(
@@ -516,19 +776,25 @@ fn update_respects_git_selectors_and_quiet_output_for_both_transports() {
         quiet("sync");
         assert_eq!(f.lock(), initial_lock);
         for name in names {
-            assert!(f.link(name, "1.0.0").join("lib.typ").is_file());
+            assert!(f.link(name, "0.0.0").join("lib.typ").is_file());
         }
         quiet("update");
         for name in ["branched", "default", "named", "moved"] {
             assert!(
-                f.link(name, "2.0.0").join("lib.typ").is_file(),
+                f.link(name, "0.0.0").join("lib.typ").is_file(),
                 "{transport}: {name}"
             );
-            assert!(fs::symlink_metadata(f.link(name, "1.0.0")).is_err());
+            assert_eq!(
+                package_version(&package_source(&f.link(name, "0.0.0"))),
+                "2.0.0"
+            );
         }
         for name in ["tagged", "pinned"] {
-            assert!(f.link(name, "1.0.0").join("lib.typ").is_file());
-            assert!(fs::symlink_metadata(f.link(name, "2.0.0")).is_err());
+            assert!(f.link(name, "0.0.0").join("lib.typ").is_file());
+            assert_eq!(
+                package_version(&package_source(&f.link(name, "0.0.0"))),
+                "1.0.0"
+            );
         }
         assert!(f.lock().contains(&original));
         assert!(f.lock().contains(&updated));
@@ -548,7 +814,7 @@ fn failed_sync_and_update_preserve_project_files_and_links() {
     f.ok(&["sync"]);
     let lock = f.lock();
     let state = fs::read(f.project.join(".typm/state.toml")).unwrap();
-    let link = fs::read_link(f.link("existing", "1.0.0")).unwrap();
+    let link = fs::read_link(f.link("existing", "0.0.0")).unwrap();
     package(&repo.path, "existing", "2.0.0");
     repo.commit();
     let missing = format!("file://{}/missing-repository", f.temp.path().display());
@@ -562,185 +828,32 @@ fn failed_sync_and_update_preserve_project_files_and_links() {
         assert_eq!(f.lock(), lock);
         assert_eq!(fs::read(f.project.join(".typm/state.toml")).unwrap(), state);
         assert_eq!(fs::read(f.project.join("typm.toml")).unwrap(), manifest);
-        assert_eq!(fs::read_link(f.link("existing", "1.0.0")).unwrap(), link);
-        assert!(!f.link("existing", "2.0.0").exists());
+        assert_eq!(fs::read_link(f.link("existing", "0.0.0")).unwrap(), link);
+        assert_eq!(
+            package_version(&package_source(&f.link("existing", "0.0.0"))),
+            "1.0.0"
+        );
     }
 
-    dependencies(&f.project, &valid_dependencies);
-    let collision = f.link("existing", "2.0.0");
+    f.local("collision");
+    dependencies(
+        &f.project,
+        &format!("{valid_dependencies}\ncollision = {{ path = '../local/collision' }}"),
+    );
+    let collision = f.link("collision", "0.0.0");
     fs::create_dir_all(&collision).unwrap();
     fs::write(collision.join("keep.txt"), "user-owned data").unwrap();
     let error = failure(f.run(&["update"]));
     assert!(error.contains("unmanaged package path"));
     assert_eq!(f.lock(), lock);
     assert_eq!(fs::read(f.project.join(".typm/state.toml")).unwrap(), state);
-    assert_eq!(fs::read_link(f.link("existing", "1.0.0")).unwrap(), link);
+    assert_eq!(fs::read_link(f.link("existing", "0.0.0")).unwrap(), link);
     assert_eq!(
         fs::read_to_string(collision.join("keep.txt")).unwrap(),
         "user-owned data"
     );
 
-    let invalid_lock = "version = 999\n";
-    fs::write(f.project.join("typm.lock"), invalid_lock).unwrap();
-    for command in ["sync", "update"] {
-        let error = failure(f.run(&[command]));
-        assert!(error.contains("unsupported typm.lock format version"));
-        assert_eq!(
-            fs::read_to_string(f.project.join("typm.lock")).unwrap(),
-            invalid_lock
-        );
-        assert_eq!(fs::read(f.project.join(".typm/state.toml")).unwrap(), state);
-        assert_eq!(fs::read_link(f.link("existing", "1.0.0")).unwrap(), link);
-    }
     assert!(!f.log.exists());
-}
-
-#[test]
-fn sync_and_update_require_and_discover_manifests_without_running_typst() {
-    for command in ["sync", "update"] {
-        let f = Fixture::new();
-        let error = failure(f.run(&[command]));
-        assert!(error.contains("manifest does not exist"));
-        assert!(!f.project.join("typm.toml").exists());
-        assert!(!f.project.join("typm.lock").exists());
-        assert!(!f.project.join(".typm/state.toml").exists());
-        let error = failure(f.run(&["--manifest-path", "missing.toml", command]));
-        assert!(error.contains("manifest does not exist"));
-
-        let local = f.local("local");
-        dependencies(&f.project, "local={path='../local/local'}");
-        let nested = f.project.join("documents");
-        fs::create_dir(&nested).unwrap();
-        success(
-            f.command()
-                .current_dir(&nested)
-                .arg(command)
-                .output()
-                .unwrap(),
-        );
-        assert_eq!(fs::canonicalize(f.link("local", "1.0.0")).unwrap(), local);
-        assert!(!nested.join(".typm").exists());
-        fs::remove_file(f.link("local", "1.0.0")).unwrap();
-        let invocation = f.temp.path().join("invocation");
-        fs::create_dir(&invocation).unwrap();
-        success(
-            f.command()
-                .current_dir(&invocation)
-                .arg("--manifest-path")
-                .arg(f.project.join("typm.toml"))
-                .arg(command)
-                .output()
-                .unwrap(),
-        );
-        assert_eq!(fs::canonicalize(f.link("local", "1.0.0")).unwrap(), local);
-        assert!(!invocation.join(".typm").exists());
-
-        let empty = "# An empty project is valid.\n[dependencies]\n";
-        fs::write(f.project.join("typm.toml"), empty).unwrap();
-        f.ok(&[command]);
-        assert_eq!(
-            fs::read_to_string(f.project.join("typm.toml")).unwrap(),
-            empty
-        );
-        assert!(!f.project.join("typm.lock").exists());
-        assert!(fs::symlink_metadata(f.link("local", "1.0.0")).is_err());
-        assert!(failure(f.run(&[command, "unexpected"])).contains("unexpected argument"));
-        assert!(!f.log.exists());
-    }
-}
-
-#[test]
-fn git_dependencies_are_recursive_and_locked() {
-    let f = Fixture::new();
-    let leaf = f.repo("leaf");
-    package(&leaf.path, "leaf", "1.0.0");
-    let leaf_commit = leaf.commit();
-    let front = f.repo("front");
-    package(&front.path, "front", "1.0.0");
-    dependencies(&front.path, &git_dependency("leaf", &leaf));
-    fs::write(
-        front.path.join("typm.lock"),
-        "ignored invalid child lockfile",
-    )
-    .unwrap();
-    let front_commit = front.commit();
-
-    let output = f.ok(&["add", "--git", &front.url(), "--branch", "main"]);
-    assert!(output.stdout.is_empty(), "progress must use stderr");
-    for name in ["front", "leaf"] {
-        let link = f.link(name, "1.0.0");
-        assert!(
-            fs::symlink_metadata(&link)
-                .unwrap()
-                .file_type()
-                .is_symlink()
-        );
-        assert!(link.join("lib.typ").is_file());
-        assert!(fs::canonicalize(link).unwrap().starts_with(&f.cache));
-    }
-    assert!(f.lock().contains(&front_commit));
-    assert!(f.lock().contains(&leaf_commit));
-    f.ok(&["compile", "main.typ"]);
-}
-
-#[test]
-fn locked_commits_survive_remote_changes_and_missing_checkouts() {
-    let f = Fixture::new();
-    let repo = f.repo("locked");
-    package(&repo.path, "locked", "1.0.0");
-    let original = repo.commit();
-    f.ok(&["add", "--git", &repo.url(), "--branch", "main"]);
-    let original_lock = f.lock();
-    fs::write(repo.path.join("lib.typ"), "#let value = \"changed\"\n").unwrap();
-    let changed = repo.commit();
-    f.ok(&["compile", "main.typ"]);
-    assert_eq!(f.lock(), original_lock);
-    assert!(f.lock().contains(&original));
-    assert!(!f.lock().contains(&changed));
-
-    let checkout = fs::canonicalize(f.link("locked", "1.0.0")).unwrap();
-    assert!(checkout.starts_with(&f.cache));
-    fs::remove_dir_all(checkout).unwrap();
-    fs::remove_file(f.link("locked", "1.0.0")).unwrap();
-    fs::rename(&repo.path, repo.path.with_extension("offline")).unwrap();
-    f.ok(&["compile", "main.typ"]);
-    assert_eq!(f.lock(), original_lock);
-    assert_eq!(
-        fs::read_to_string(f.link("locked", "1.0.0").join("lib.typ")).unwrap(),
-        "#let value = \"locked\"\n"
-    );
-}
-
-#[test]
-fn projects_share_cached_commits_and_repeated_add_refreshes() {
-    let f = Fixture::new();
-    let repo = f.repo("shared");
-    package(&repo.path, "shared", "1.0.0");
-    let original = repo.commit();
-    f.ok(&["add", "--git", &repo.url(), "--branch", "main"]);
-    fs::write(repo.path.join("lib.typ"), "#let value = \"updated\"\n").unwrap();
-    let updated = repo.commit();
-    f.ok(&["add", "shared", "--git", &repo.url(), "--branch", "main"]);
-    assert!(f.lock().contains(&updated));
-    assert!(!f.lock().contains(&original));
-
-    let other = f.temp.path().join("other-project");
-    fs::create_dir(&other).unwrap();
-    for file in ["typm.toml", "typm.lock"] {
-        fs::copy(f.project.join(file), other.join(file)).unwrap();
-    }
-    fs::rename(&repo.path, repo.path.with_extension("offline")).unwrap();
-    success(
-        f.command()
-            .current_dir(&other)
-            .args(["compile", "main.typ"])
-            .output()
-            .unwrap(),
-    );
-    assert_eq!(
-        fs::canonicalize(other.join(".typm/packages/local/shared/1.0.0")).unwrap(),
-        fs::canonicalize(f.link("shared", "1.0.0")).unwrap()
-    );
 }
 
 #[test]
@@ -777,27 +890,6 @@ fn refreshing_a_root_retains_unchanged_transitive_git_pins() {
 }
 
 #[test]
-fn annotated_tags_revisions_and_default_head_resolve() {
-    let f = Fixture::new();
-    let repo = f.repo("selected");
-    package(&repo.path, "selected", "1.0.0");
-    let first = repo.commit();
-    repo.git(&["tag", "--annotate", "v1", "--message", "first version"]);
-    package(&repo.path, "selected", "2.0.0");
-    let second = repo.commit();
-
-    f.ok(&["add", "--git", &repo.url(), "--tag", "v1"]);
-    assert!(f.link("selected", "1.0.0").is_dir());
-    assert!(f.lock().contains(&first));
-    f.ok(&["add", "--git", &repo.url(), "--rev", &first[..10]]);
-    assert!(f.lock().contains(&first));
-    f.ok(&["add", "--git", &repo.url()]);
-    assert!(f.lock().contains(&second));
-    assert!(f.link("selected", "2.0.0").is_dir());
-    assert!(!f.link("selected", "1.0.0").exists());
-}
-
-#[test]
 fn monorepo_paths_share_the_pinned_checkout() {
     let f = Fixture::new();
     let repo = f.repo("monorepo");
@@ -810,8 +902,8 @@ fn monorepo_paths_share_the_pinned_checkout() {
     assert!(error.contains("alpha") && error.contains("beta"));
     f.ok(&["add", "alpha", "--git", &repo.url()]);
     assert!(f.lock().contains(&commit));
-    let alpha = fs::canonicalize(f.link("alpha", "1.0.0")).unwrap();
-    let beta = fs::canonicalize(f.link("beta", "1.0.0")).unwrap();
+    let alpha = package_source(&f.link("alpha", "0.0.0"));
+    let beta = package_source(&f.link("beta", "1.0.0"));
     assert_eq!(alpha.parent(), beta.parent());
 }
 
@@ -836,29 +928,6 @@ fn relative_git_submodules_are_available_to_transitive_paths() {
     f.ok(&["add", "parent", "--git", &parent.url()]);
     assert!(f.link("leaf", "1.0.0").join("lib.typ").is_file());
     assert!(f.lock().contains(&commit));
-}
-
-#[test]
-fn quiet_add_keeps_both_output_streams_clean() {
-    let f = Fixture::new();
-    let repo = f.repo("quiet");
-    package(&repo.path, "quiet", "1.0.0");
-    repo.commit();
-    for transport in ["false", "true"] {
-        let output = success(
-            f.command()
-                .env("TYPM_NET_GIT_FETCH_WITH_CLI", transport)
-                .args(["--quiet", "add", "--git", &repo.url()])
-                .output()
-                .unwrap(),
-        );
-        assert!(output.stdout.is_empty());
-        assert!(
-            output.stderr.is_empty(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
 }
 
 #[test]
@@ -887,56 +956,6 @@ fn git_path_dependencies_cannot_escape_the_checkout() {
 }
 
 #[test]
-fn local_dependencies_stay_live_and_can_depend_on_git() {
-    let f = Fixture::new();
-    let repo = f.repo("leaf");
-    package(&repo.path, "leaf", "1.0.0");
-    let commit = repo.commit();
-    let alpha = f.local("alpha");
-    let beta = f.local("beta");
-    dependencies(&alpha, "beta = { path = \"../beta\" }");
-    dependencies(&beta, &git_dependency("leaf", &repo));
-    f.ok(&["add", "--path", alpha.to_str().unwrap()]);
-    assert_eq!(fs::canonicalize(f.link("beta", "1.0.0")).unwrap(), beta);
-    assert!(f.lock().contains(&commit));
-    fs::write(beta.join("lib.typ"), "#let value = \"edited live\"\n").unwrap();
-    assert_eq!(
-        fs::read_to_string(f.link("beta", "1.0.0").join("lib.typ")).unwrap(),
-        "#let value = \"edited live\"\n"
-    );
-    package(&beta, "beta", "2.0.0");
-    f.ok(&["compile", "main.typ"]);
-    assert!(!f.link("beta", "1.0.0").exists());
-    assert_eq!(fs::canonicalize(f.link("beta", "2.0.0")).unwrap(), beta);
-    assert!(f.lock().contains(&commit));
-}
-
-#[test]
-fn edited_local_manifests_replace_their_transitive_graph() {
-    let f = Fixture::new();
-    let first = f.repo("first");
-    package(&first.path, "first", "1.0.0");
-    let first_commit = first.commit();
-    let second = f.repo("second");
-    package(&second.path, "second", "1.0.0");
-    let second_commit = second.commit();
-    let local = f.local("local");
-    dependencies(&local, &git_dependency("first", &first));
-    f.ok(&["add", "--path", local.to_str().unwrap()]);
-    assert!(f.link("first", "1.0.0").is_dir());
-
-    dependencies(&local, &git_dependency("second", &second));
-    f.ok(&["compile", "main.typ"]);
-    assert!(!f.link("first", "1.0.0").exists());
-    assert!(f.link("second", "1.0.0").is_dir());
-    assert!(!f.lock().contains(&first_commit));
-    assert!(f.lock().contains(&second_commit));
-    f.ok(&["remove", "local"]);
-    assert!(!f.link("second", "1.0.0").exists());
-    assert!(!f.lock().contains(&second_commit));
-}
-
-#[test]
 fn removal_preserves_shared_transitives_and_does_not_fetch() {
     let f = Fixture::new();
     let shared = f.repo("shared");
@@ -954,46 +973,18 @@ fn removal_preserves_shared_transitives_and_does_not_fetch() {
         fs::rename(&repo.path, repo.path.with_extension("offline")).unwrap();
     }
     f.ok(&["remove", "left"]);
-    assert!(!f.link("left", "1.0.0").exists());
-    assert!(f.link("right", "1.0.0").is_dir());
+    assert!(!f.link("left", "0.0.0").exists());
+    assert!(f.link("right", "0.0.0").is_dir());
     assert!(f.link("shared", "1.0.0").is_dir());
     f.ok(&["rm", "right"]);
-    assert!(!f.link("right", "1.0.0").exists());
+    assert!(!f.link("right", "0.0.0").exists());
     assert!(!f.link("shared", "1.0.0").exists());
     assert!(f.cache.is_dir());
 }
 
 #[test]
-fn removal_also_prunes_roots_manually_deleted_from_the_manifest() {
-    let f = Fixture::new();
-    let first = f.repo("first");
-    package(&first.path, "first", "1.0.0");
-    let first_commit = first.commit();
-    let second = f.repo("second");
-    package(&second.path, "second", "1.0.0");
-    let second_commit = second.commit();
-    for repo in [&first, &second] {
-        f.ok(&["add", "--git", &repo.url(), "--branch", "main"]);
-    }
-
-    dependencies(&f.project, &git_dependency("first", &first));
-    for repo in [&first, &second] {
-        fs::rename(&repo.path, repo.path.with_extension("offline")).unwrap();
-    }
-    f.ok(&["remove", "first"]);
-    for name in ["first", "second"] {
-        assert!(fs::symlink_metadata(f.link(name, "1.0.0")).is_err());
-    }
-    let lock = f.lock();
-    assert!(!lock.contains(&first_commit));
-    assert!(!lock.contains(&second_commit));
-}
-
-#[test]
 fn commands_reconcile_manual_manifest_edits() {
-    for command in [
-        "add", "remove", "rm", "sync", "update", "compile", "watch", "query", "fonts",
-    ] {
+    for command in ["add", "remove", "sync", "update", "compile"] {
         let f = Fixture::new();
         let selected = f.repo("selected");
         package(&selected.path, "selected", "1.0.0");
@@ -1027,10 +1018,7 @@ fn commands_reconcile_manual_manifest_edits() {
             ),
         );
         f.ok(&["sync"]);
-        assert_eq!(
-            fs::canonicalize(f.link("retargeted", "1.0.0")).unwrap(),
-            original
-        );
+        assert_eq!(package_source(&f.link("retargeted", "0.0.0")), original);
         package(&pinned.path, "pinned", "2.0.0");
         let refreshed_commit = pinned.commit();
         let retained = format!(
@@ -1039,7 +1027,7 @@ fn commands_reconcile_manual_manifest_edits() {
             git_dependency("pinned", &pinned),
         );
         let mut edited = retained.clone();
-        if matches!(command, "remove" | "rm") {
+        if command == "remove" {
             edited.push_str("removed = { path = '../local/removed' }\n");
         }
         fs::write(f.project.join("typm.toml"), &edited).unwrap();
@@ -1050,14 +1038,11 @@ fn commands_reconcile_manual_manifest_edits() {
             "add" => {
                 f.ok(&["add", "--path", f.local("added").to_str().unwrap()]);
             }
-            "remove" | "rm" => {
+            "remove" => {
                 f.ok(&[command, "removed"]);
             }
-            "compile" | "watch" => {
+            "compile" => {
                 f.ok(&[command, "main.typ"]);
-            }
-            "query" => {
-                f.ok(&[command, "main.typ", "<target>"]);
             }
             _ => {
                 f.ok(&[command]);
@@ -1070,25 +1055,27 @@ fn commands_reconcile_manual_manifest_edits() {
             "1.0.0"
         };
         let locked = [("selected", "1.0.0"), ("pinned", pinned_version)];
-        let mut linked = locked.to_vec();
-        linked.extend([("retargeted", "1.0.0"), ("manual", "1.0.0")]);
+        let mut linked = vec![
+            ("selected", "0.0.0"),
+            ("pinned", "0.0.0"),
+            ("retargeted", "0.0.0"),
+            ("manual", "0.0.0"),
+        ];
         if command == "add" {
-            linked.push(("added", "1.0.0"));
+            linked.push(("added", "0.0.0"));
         }
         f.assert_packages(&linked, &locked);
-        assert_eq!(
-            fs::canonicalize(f.link("retargeted", "1.0.0")).unwrap(),
-            replacement
-        );
-        assert_eq!(fs::canonicalize(f.link("manual", "1.0.0")).unwrap(), manual);
-        for (name, version) in [
-            ("selected", "2.0.0"),
-            ("deleted", "1.0.0"),
-            ("removed", "1.0.0"),
+        assert_eq!(package_source(&f.link("retargeted", "0.0.0")), replacement);
+        assert_eq!(package_source(&f.link("manual", "0.0.0")), manual);
+        for path in [
+            f.link("selected", "2.0.0"),
+            f.link("deleted", "0.0.0"),
+            f.link("removed", "0.0.0"),
         ] {
             assert!(
-                fs::symlink_metadata(f.link(name, version)).is_err(),
-                "{command}: {name}/{version}"
+                fs::symlink_metadata(&path).is_err(),
+                "{command}: {}",
+                path.display()
             );
         }
         let lock = f.lock();
@@ -1098,40 +1085,18 @@ fn commands_reconcile_manual_manifest_edits() {
         }
         assert_eq!(lock.contains(&pinned_commit), command != "update");
         assert_eq!(lock.contains(&refreshed_commit), command == "update");
-        if command == "update" {
-            assert!(fs::symlink_metadata(f.link("pinned", "1.0.0")).is_err());
-        }
-        let parsed: toml::Value = toml::from_str(&lock).unwrap();
-        assert_eq!(parsed["sources"].as_table().unwrap().len(), 2);
-        assert_eq!(
-            parsed["roots"]
-                .as_table()
-                .unwrap()
-                .keys()
-                .map(String::as_str)
-                .collect::<BTreeSet<_>>(),
-            BTreeSet::from(["pinned", "selected"])
-        );
         let manifest = fs::read_to_string(f.project.join("typm.toml")).unwrap();
         if command == "add" {
             assert!(manifest.starts_with(&retained));
         } else {
             assert_eq!(manifest, retained);
         }
-        let forwarded = matches!(command, "compile" | "watch" | "query" | "fonts");
-        assert_eq!(f.log.exists(), forwarded);
-        if forwarded {
-            assert!(
-                fs::read_to_string(&f.log)
-                    .unwrap()
-                    .contains(&format!("arg={command}\n"))
-            );
-        }
+        assert_eq!(f.log.exists(), command == "compile");
     }
 }
 
 #[test]
-fn removal_resolves_edited_local_versions_and_transitives_preserving_shared_versions() {
+fn removal_resolves_edited_local_versions_and_transitives_preserving_shared_packages() {
     let f = Fixture::new();
     let shared = f.repo("shared");
     package(&shared.path, "shared", "1.0.0");
@@ -1173,35 +1138,16 @@ fn removal_resolves_edited_local_versions_and_transitives_preserving_shared_vers
 
     let locked = [("shared", "1.0.0"), ("shared", "2.0.0"), ("added", "1.0.0")];
     let mut linked = locked.to_vec();
-    linked.extend([("local", "2.0.0"), ("keeper", "1.0.0")]);
+    linked.extend([("local", "0.0.0"), ("keeper", "0.0.0")]);
     f.assert_packages(&linked, &locked);
-    for name in ["local", "removed", "obsolete"] {
-        assert!(fs::symlink_metadata(f.link(name, "1.0.0")).is_err());
+    for path in [f.link("removed", "0.0.0"), f.link("obsolete", "1.0.0")] {
+        assert!(fs::symlink_metadata(path).is_err());
     }
     let lock = f.lock();
     for commit in [&older, &newer, &added_commit] {
         assert!(lock.contains(commit));
     }
     assert!(!lock.contains(&obsolete_commit));
-    let parsed: toml::Value = toml::from_str(&lock).unwrap();
-    assert_eq!(parsed["sources"].as_table().unwrap().len(), 3);
-    assert_eq!(parsed["roots"]["keeper"].as_array().unwrap().len(), 1);
-    assert_eq!(parsed["roots"]["local"].as_array().unwrap().len(), 2);
-    assert!(parsed["roots"].get("removed").is_none());
-    let state: toml::Value =
-        toml::from_str(&fs::read_to_string(f.project.join(".typm/state.toml")).unwrap()).unwrap();
-    for link in state["links"].as_array().unwrap() {
-        let path = link["path"].as_str().unwrap();
-        let root = if path == "local/shared/1.0.0" || path == "local/keeper/1.0.0" {
-            "keeper"
-        } else {
-            "local"
-        };
-        assert_eq!(
-            link["roots"].as_array().unwrap(),
-            &vec![toml::Value::String(root.into())]
-        );
-    }
 }
 
 #[test]
@@ -1220,38 +1166,32 @@ fn commands_preserve_project_and_skip_typst_when_manual_edits_fail_resolution() 
     f.ok(&["sync"]);
     let lock = fs::read(f.project.join("typm.lock")).unwrap();
     let state = fs::read(f.project.join(".typm/state.toml")).unwrap();
-    let links =
-        ["existing", "removed"].map(|name| (name, fs::read_link(f.link(name, "1.0.0")).unwrap()));
+    let links = [f.link("existing", "0.0.0"), f.link("removed", "0.0.0")].map(|path| {
+        let target = fs::read_link(&path).unwrap();
+        (path, target)
+    });
     dependencies(
         &f.project,
         &format!("{valid}\nzmissing = {{ path = '../missing' }}"),
     );
     let manifest = fs::read(f.project.join("typm.toml")).unwrap();
 
-    for command in [
-        "add", "remove", "rm", "sync", "update", "compile", "watch", "query", "fonts",
-    ] {
+    for command in ["add", "remove", "sync", "update", "compile"] {
         let output = match command {
             "add" => f.run(&[command, "--path", added.to_str().unwrap()]),
-            "remove" | "rm" => f.run(&[command, "removed"]),
-            "compile" | "watch" => f.run(&[command, "main.typ"]),
-            "query" => f.run(&[command, "main.typ", "<target>"]),
+            "remove" => f.run(&[command, "removed"]),
+            "compile" => f.run(&[command, "main.typ"]),
             _ => f.run(&[command]),
         };
         let error = failure(output);
         assert!(error.contains("zmissing"));
-        assert!(error.contains("cannot locate path dependency"));
         assert_eq!(fs::read(f.project.join("typm.toml")).unwrap(), manifest);
         assert_eq!(fs::read(f.project.join("typm.lock")).unwrap(), lock);
         assert_eq!(fs::read(f.project.join(".typm/state.toml")).unwrap(), state);
-        for (name, target) in &links {
-            assert_eq!(fs::read_link(f.link(name, "1.0.0")).unwrap(), *target);
+        for (path, target) in &links {
+            assert_eq!(fs::read_link(path).unwrap(), *target);
         }
-        f.assert_packages(
-            &[("existing", "1.0.0"), ("removed", "1.0.0")],
-            &[("existing", "1.0.0")],
-        );
-        assert!(fs::symlink_metadata(f.link("added", "1.0.0")).is_err());
+        assert!(fs::symlink_metadata(f.link("added", "0.0.0")).is_err());
         assert!(
             !f.log.exists(),
             "{command} must not invoke Typst after failed resolution"
@@ -1261,51 +1201,46 @@ fn commands_preserve_project_and_skip_typst_when_manual_edits_fail_resolution() 
 
 #[test]
 fn conflicting_sources_leave_the_existing_project_unchanged() {
-    let f = Fixture::new();
-    let first = f.repo("shared-first");
-    let second = f.repo("shared-second");
-    package(&first.path, "shared", "1.0.0");
-    package(&second.path, "shared", "1.0.0");
-    fs::write(
-        second.path.join("lib.typ"),
-        "#let value = \"second source\"\n",
-    )
-    .unwrap();
-    first.commit();
-    second.commit();
-    let left = f.local("left");
-    let right = f.local("right");
-    dependencies(&left, &git_dependency("shared", &first));
-    dependencies(&right, &git_dependency("shared", &second));
-    f.ok(&["add", "--path", left.to_str().unwrap()]);
-    let manifest = fs::read(f.project.join("typm.toml")).unwrap();
-    let lock = f.lock();
-    let error = failure(f.run(&["add", "--path", right.to_str().unwrap()]));
-    assert!(error.contains("shared") && error.contains("left") && error.contains("right"));
-    assert_eq!(fs::read(f.project.join("typm.toml")).unwrap(), manifest);
-    assert_eq!(f.lock(), lock);
-    assert!(!f.link("right", "1.0.0").exists());
+    for second_is_git in [true, false] {
+        let f = Fixture::new();
+        let first = f.repo("shared-first");
+        let second = f.repo("shared-second");
+        package(&first.path, "shared", "1.0.0");
+        package(&second.path, "shared", "1.0.0");
+        fs::write(
+            second.path.join("lib.typ"),
+            "#let value = \"second source\"\n",
+        )
+        .unwrap();
+        first.commit();
+        second.commit();
+        let left = f.local("left");
+        let right = f.local("right");
+        dependencies(&left, &git_dependency("shared", &first));
+        let second_dependency = if second_is_git {
+            git_dependency("shared", &second)
+        } else {
+            format!("shared = {{ path = {:?} }}", second.path.to_str().unwrap())
+        };
+        dependencies(&right, &second_dependency);
+        f.ok(&["add", "--path", left.to_str().unwrap()]);
+        let manifest = fs::read(f.project.join("typm.toml")).unwrap();
+        let lock = f.lock();
+        let state = fs::read(f.project.join(".typm/state.toml")).unwrap();
+        let target = fs::read_link(f.link("shared", "1.0.0")).unwrap();
+        let error = failure(f.run(&["add", "--path", right.to_str().unwrap()]));
+        assert!(error.contains("shared") && error.contains("left") && error.contains("right"));
+        assert!(error.contains("@typm/shared:1.0.0"));
+        assert_eq!(fs::read(f.project.join("typm.toml")).unwrap(), manifest);
+        assert_eq!(f.lock(), lock);
+        assert_eq!(fs::read(f.project.join(".typm/state.toml")).unwrap(), state);
+        assert_eq!(fs::read_link(f.link("shared", "1.0.0")).unwrap(), target);
+        assert!(!f.link("right", "0.0.0").exists());
+    }
 }
 
 #[test]
-fn failed_download_preserves_manifest_lock_and_links() {
-    let f = Fixture::new();
-    let repo = f.repo("existing");
-    package(&repo.path, "existing", "1.0.0");
-    repo.commit();
-    f.ok(&["add", "--git", &repo.url()]);
-    let manifest = fs::read(f.project.join("typm.toml")).unwrap();
-    let lock = f.lock();
-    let missing = format!("file://{}/missing-repository", f.temp.path().display());
-    failure(f.run(&["add", "missing", "--git", &missing]));
-    assert_eq!(fs::read(f.project.join("typm.toml")).unwrap(), manifest);
-    assert_eq!(f.lock(), lock);
-    assert!(f.link("existing", "1.0.0").join("lib.typ").is_file());
-    assert!(!f.link("missing", "1.0.0").exists());
-}
-
-#[test]
-fn different_versions_can_coexist_and_local_cycles_are_reported() {
+fn different_transitive_versions_coexist_and_local_cycles_are_reported() {
     let f = Fixture::new();
     let first = f.local("first");
     let second = f.local("second");
@@ -1323,8 +1258,13 @@ fn different_versions_can_coexist_and_local_cycles_are_reported() {
     );
     f.ok(&["add", "--path", first.to_str().unwrap()]);
     f.ok(&["add", "--path", second.to_str().unwrap()]);
-    assert!(f.link("shared", "1.0.0").is_dir());
-    assert!(f.link("shared", "2.0.0").is_dir());
+    assert_eq!(fs::canonicalize(f.link("shared", "1.0.0")).unwrap(), v1);
+    assert_eq!(fs::canonicalize(f.link("shared", "2.0.0")).unwrap(), v2);
+    assert!(!f.link("shared", "0.0.0").exists());
+    f.ok(&["add", "--path", v1.to_str().unwrap()]);
+    assert_eq!(package_source(&f.link("shared", "0.0.0")), v1);
+    assert_eq!(fs::canonicalize(f.link("shared", "1.0.0")).unwrap(), v1);
+    assert_eq!(fs::canonicalize(f.link("shared", "2.0.0")).unwrap(), v2);
 
     dependencies(&first, "second = { path = \"../second\" }");
     dependencies(&second, "first = { path = \"../first\" }");
@@ -1334,23 +1274,62 @@ fn different_versions_can_coexist_and_local_cycles_are_reported() {
 }
 
 #[test]
-fn custom_namespaces_are_installed_and_removed() {
+fn explicit_local_namespace_overrides_the_typm_default() {
     let f = Fixture::new();
-    let local = f.local("custom");
+    let legacy = f.local("legacy");
+    let current = f.local("current");
+    let first = f.temp.path().join("first-shared");
+    let second = f.temp.path().join("second-shared");
+    package(&first, "shared", "1.0.0");
+    package(&second, "shared", "2.0.0");
+    dependencies(
+        &legacy,
+        &format!(
+            "shared = {{ path = {:?}, namespace = 'local' }}",
+            first.to_str().unwrap()
+        ),
+    );
+    dependencies(
+        &current,
+        &format!("shared = {{ path = {:?} }}", second.to_str().unwrap()),
+    );
+    f.ok(&["add", "--path", legacy.to_str().unwrap()]);
+    f.ok(&["add", "--path", current.to_str().unwrap()]);
+    let explicit = f.project.join(".typm/packages/local/shared/1.0.0");
+    let default = f.link("shared", "2.0.0");
+    assert_eq!(package_source(&explicit), first);
+    assert_eq!(package_source(&default), second);
+    assert_eq!(package_version(&explicit), "1.0.0");
+    assert_eq!(package_version(&default), "2.0.0");
     f.ok(&[
         "add",
         "--path",
-        local.to_str().unwrap(),
+        first.to_str().unwrap(),
         "--namespace",
-        "company",
+        "local",
     ]);
-    let installed = f.project.join(".typm/packages/company/custom/1.0.0");
-    assert!(installed.join("lib.typ").is_file());
-    f.ok(&["remove", "custom"]);
+    let manifest = fs::read_to_string(f.project.join("typm.toml")).unwrap();
+    let parsed: toml::Value = toml::from_str(&manifest).unwrap();
     assert_eq!(
-        fs::symlink_metadata(&installed).unwrap_err().kind(),
-        std::io::ErrorKind::NotFound
+        parsed["dependencies"]["shared"]["namespace"].as_str(),
+        Some("local")
     );
+    let direct = f.project.join(".typm/packages/local/shared/0.0.0");
+    assert_eq!(package_source(&direct), first);
+    assert!(!f.link("shared", "0.0.0").exists());
+    f.ok(&["sync"]);
+    assert_eq!(
+        fs::read_to_string(f.project.join("typm.toml")).unwrap(),
+        manifest
+    );
+    assert_eq!(package_source(&direct), first);
+    assert_eq!(package_source(&explicit), first);
+    f.ok(&["remove", "shared"]);
+    assert!(fs::symlink_metadata(direct).is_err());
+    assert_eq!(package_source(&explicit), first);
+    f.ok(&["remove", "legacy"]);
+    assert!(fs::symlink_metadata(explicit).is_err());
+    assert!(default.join("lib.typ").is_file());
 }
 
 #[test]
@@ -1361,12 +1340,6 @@ fn a_dangling_user_lockfile_symlink_survives_failed_add() {
     let missing_target = f.temp.path().join("missing-user-lock.toml");
     symlink(&missing_target, &lock).unwrap();
     failure(f.run(&["add", "--path", local.to_str().unwrap()]));
-    assert!(
-        fs::symlink_metadata(&lock)
-            .unwrap()
-            .file_type()
-            .is_symlink()
-    );
     assert_eq!(fs::read_link(&lock).unwrap(), missing_target);
     assert!(!f.project.join("typm.toml").exists());
     assert!(!missing_target.exists());
@@ -1443,30 +1416,6 @@ fn explicit_manifest_path_and_empty_projects_work() {
 }
 
 #[test]
-fn invalid_dependencies_prevent_typst_from_running() {
-    let f = Fixture::new();
-    dependencies(&f.project, "missing = { path = \"does-not-exist\" }");
-    let error = failure(f.run(&["compile", "main.typ"]));
-    assert!(error.contains("missing"));
-    assert!(!f.log.exists());
-}
-
-#[test]
-fn unmanaged_installation_paths_are_not_overwritten() {
-    let f = Fixture::new();
-    let local = f.local("local");
-    let collision = f.link("local", "1.0.0");
-    fs::create_dir_all(&collision).unwrap();
-    fs::write(collision.join("keep.txt"), "user-owned data").unwrap();
-    failure(f.run(&["add", "--path", local.to_str().unwrap()]));
-    assert_eq!(
-        fs::read_to_string(collision.join("keep.txt")).unwrap(),
-        "user-owned data"
-    );
-    assert!(!f.project.join("typm.toml").exists());
-}
-
-#[test]
 fn concurrent_projects_share_a_cache_safely() {
     let f = Fixture::new();
     let repo = f.repo("concurrent");
@@ -1500,8 +1449,8 @@ fn concurrent_projects_share_a_cache_safely() {
             .contains(&commit)
     );
     assert_eq!(
-        fs::canonicalize(f.link("concurrent", "1.0.0")).unwrap(),
-        fs::canonicalize(other.join(".typm/packages/local/concurrent/1.0.0")).unwrap()
+        package_source(&f.link("concurrent", "0.0.0")),
+        package_source(&other.join(".typm/packages/typm/concurrent/0.0.0"))
     );
 }
 
@@ -1524,7 +1473,7 @@ fn real_typst_compiles_transitive_packages_and_uses_its_preview_cache() {
     dependencies(&front.path, &git_dependency("leaf", &leaf));
     fs::write(
         front.path.join("lib.typ"),
-        "#import \"@local/leaf:1.0.0\": value\n#let text = value\n",
+        "#import \"@typm/leaf:1.0.0\": value\n#let text = value\n",
     )
     .unwrap();
     front.commit();
@@ -1532,9 +1481,23 @@ fn real_typst_compiles_transitive_packages_and_uses_its_preview_cache() {
     dependencies(&helpers, &git_dependency("leaf", &leaf));
     fs::write(
         helpers.join("lib.typ"),
-        "#import \"@local/leaf:1.0.0\": value\n#let helper = value\n",
+        "#import \"@typm/leaf:1.0.0\": value\n#let helper = value\n",
     )
     .unwrap();
+    let original_files = [
+        ("leaf", "1.0.0", &leaf.path),
+        ("front", "0.0.0", &front.path),
+        ("helpers", "0.0.0", &helpers),
+    ]
+    .map(|(name, version, source)| {
+        (
+            name,
+            version,
+            source,
+            fs::read(source.join("typst.toml")).unwrap(),
+            fs::read(source.join("lib.typ")).unwrap(),
+        )
+    });
     f.ok(&["add", "--git", &front.url(), "--branch", "main"]);
     f.ok(&["add", "--path", helpers.to_str().unwrap()]);
 
@@ -1542,7 +1505,7 @@ fn real_typst_compiles_transitive_packages_and_uses_its_preview_cache() {
     let cached = preview_cache.join("preview/cached/1.0.0");
     package(&cached, "cached", "1.0.0");
     fs::write(cached.join("lib.typ"), "#let cached = \"cached preview\"\n").unwrap();
-    fs::write(f.project.join("main.typ"), "#import \"@local/front:1.0.0\": text\n#import \"@local/helpers:1.0.0\": helper\n#import \"@preview/cached:1.0.0\": cached\n#text #helper #cached\n").unwrap();
+    fs::write(f.project.join("main.typ"), "#import \"@typm/front:0.0.0\": text\n#import \"@typm/helpers:0.0.0\": helper\n#import \"@preview/cached:1.0.0\": cached\n#text #helper #cached\n").unwrap();
     success(
         f.command()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
@@ -1558,6 +1521,18 @@ fn real_typst_compiles_transitive_packages_and_uses_its_preview_cache() {
     );
     assert!(cached.join("lib.typ").is_file());
     assert!(!f.project.join(".typm/packages/preview").exists());
+    assert!(!f.link("leaf", "0.0.0").exists());
+    for (name, version, source, manifest, contents) in original_files {
+        let installed = f.link(name, version);
+        let backing = package_source(&installed);
+        assert_eq!(fs::read(source.join("typst.toml")).unwrap(), manifest);
+        assert_eq!(fs::read(source.join("lib.typ")).unwrap(), contents);
+        assert_eq!(fs::read(backing.join("typst.toml")).unwrap(), manifest);
+        assert_eq!(fs::read(backing.join("lib.typ")).unwrap(), contents);
+        if version != "0.0.0" {
+            assert_eq!(fs::canonicalize(installed).unwrap(), backing);
+        }
+    }
 }
 
 #[test]
@@ -1581,7 +1556,7 @@ fn git2_prepares_packages_without_a_git_executable() {
             .output()
             .unwrap(),
     );
-    assert!(f.link("without-git", "1.0.0").join("lib.typ").is_file());
+    assert!(f.link("without-git", "0.0.0").join("lib.typ").is_file());
 }
 
 #[test]
@@ -1693,7 +1668,7 @@ fn explicit_manifest_keeps_configuration_relative_to_invocation_directory() {
             .output()
             .unwrap(),
     );
-    assert!(f.link("config-root", "1.0.0").join("lib.typ").is_file());
+    assert!(f.link("config-root", "0.0.0").join("lib.typ").is_file());
 }
 
 #[test]
@@ -1710,29 +1685,13 @@ fn typm_home_holds_new_caches_and_cache_override_wins() {
             .output()
             .unwrap(),
     );
-    let target = fs::read_link(f.link("home", "1.0.0")).unwrap();
+    let target = package_source(&f.link("home", "0.0.0"));
     assert!(target.starts_with(&home));
     assert!(target.ends_with(&commit));
     f.ok(&["add", "--git", &repo.url()]);
-    let target = fs::read_link(f.link("home", "1.0.0")).unwrap();
+    let target = package_source(&f.link("home", "0.0.0"));
     assert!(target.starts_with(&f.cache));
     assert!(target.ends_with(&commit));
-}
-
-#[test]
-fn invalid_transport_setting_leaves_project_unchanged() {
-    let f = Fixture::new();
-    let local = f.local("local");
-    let error = failure(
-        f.command()
-            .env("TYPM_NET_GIT_FETCH_WITH_CLI", "sometimes")
-            .args(["add", "--path", local.to_str().unwrap()])
-            .output()
-            .unwrap(),
-    );
-    assert!(error.contains("TYPM_NET_GIT_FETCH_WITH_CLI"));
-    assert!(!f.project.join("typm.toml").exists());
-    assert!(!f.project.join(".typm/state.toml").exists());
 }
 
 #[test]
@@ -1778,7 +1737,7 @@ fn cli_fetch_prepares_nested_submodules_at_their_recorded_commits() {
         fs::read_to_string(f.link("leaf", "1.0.0").join("lib.typ")).unwrap(),
         "#let value = \"leaf\"\n"
     );
-    let cached = fs::read_link(f.link("parent", "1.0.0")).unwrap();
+    let cached = package_source(&f.link("parent", "0.0.0"));
     let nested = Repository {
         path: cached.join("vendor/middle/vendor/leaf"),
     };

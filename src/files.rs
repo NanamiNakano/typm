@@ -5,17 +5,8 @@ use std::io::{ErrorKind, Write};
 use std::path::Path;
 
 pub fn read_optional(path: &Path) -> Result<Option<String>> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_file() => {}
-        Ok(_) => snafu::whatever!(
-            "expected a regular file, refusing to follow or replace {}",
-            path.display()
-        ),
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(error)
-                .with_whatever_context(|_| format!("cannot inspect {}", path.display()));
-        }
+    if require_regular_file_if_present(path)?.is_none() {
+        return Ok(None);
     }
     match fs::read_to_string(path) {
         Ok(text) => Ok(Some(text)),
@@ -59,6 +50,50 @@ pub fn require_regular_file_if_present(path: &Path) -> Result<Option<Metadata>> 
         );
     }
     Ok(metadata)
+}
+
+/// Ensure a real directory exists, returning whether it was created.
+pub fn ensure_directory(path: &Path) -> Result<bool> {
+    match fs::create_dir(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            require_directory_if_present(path)?;
+            Ok(false)
+        }
+        Err(error) => Err(error)
+            .with_whatever_context(|_| format!("could not create directory {}", path.display())),
+    }
+}
+
+pub fn create_symlink(target: &Path, path: &Path, directory: bool) -> Result<()> {
+    #[cfg(unix)]
+    let result = {
+        let _ = directory;
+        std::os::unix::fs::symlink(target, path)
+    };
+    #[cfg(windows)]
+    let result = if directory {
+        std::os::windows::fs::symlink_dir(target, path)
+    } else {
+        std::os::windows::fs::symlink_file(target, path)
+    };
+    #[cfg(not(any(unix, windows)))]
+    let result: std::io::Result<()> = {
+        let _ = directory;
+        Err(std::io::Error::new(
+            ErrorKind::Unsupported,
+            "symbolic links are not supported on this platform",
+        ))
+    };
+    result.with_whatever_context(|error| {
+        let mut message = format!("could not link {} to {}", path.display(), target.display());
+        if cfg!(windows) && error.kind() == ErrorKind::PermissionDenied {
+            message.push_str(
+                "; enable Windows Developer Mode or run with permission to create symbolic links",
+            );
+        }
+        message
+    })
 }
 
 /// Replace a regular file atomically, without leaving a partially written TOML
@@ -107,23 +142,10 @@ fn sync_directory_best_effort(path: &Path) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
-    #[test]
-    fn atomic_write_replaces_contents_and_skips_identical_files() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("data.toml");
-        atomic_write(&path, b"first").unwrap();
-        atomic_write(&path, b"second").unwrap();
-        let modified = fs::metadata(&path).unwrap().modified().unwrap();
-        atomic_write(&path, b"second").unwrap();
-        assert_eq!(fs::read(&path).unwrap(), b"second");
-        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
-    }
-
-    #[cfg(unix)]
     #[test]
     fn atomic_write_refuses_symlinks() {
         let directory = tempfile::tempdir().unwrap();

@@ -9,8 +9,8 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use toml_edit::{DocumentMut, InlineTable, Item, Table, TableLike, Value};
 
-fn local_namespace() -> String {
-    "local".into()
+fn default_namespace() -> String {
+    "typm".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -26,7 +26,7 @@ pub struct Dependency {
     pub tag: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rev: Option<String>,
-    #[serde(default = "local_namespace")]
+    #[serde(default = "default_namespace")]
     pub namespace: String,
 }
 
@@ -83,7 +83,7 @@ impl Dependency {
                 entry.insert(key, Value::from(value.as_str()));
             }
         }
-        if self.namespace != "local" {
+        if self.namespace != "typm" {
             entry.insert("namespace", Value::from(self.namespace.as_str()));
         }
         Ok(entry)
@@ -208,10 +208,7 @@ mod tests {
     use super::*;
 
     fn document(text: &str) -> ManifestDocument {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("typm.toml");
-        fs::write(&path, text).unwrap();
-        ManifestDocument::read(&path).unwrap()
+        ManifestDocument::parse(Path::new("typm.toml"), text).unwrap()
     }
 
     fn local_dependency(path: &str) -> Dependency {
@@ -221,7 +218,7 @@ mod tests {
             branch: None,
             tag: None,
             rev: None,
-            namespace: "local".to_owned(),
+            namespace: "typm".to_owned(),
         }
     }
 

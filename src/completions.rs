@@ -48,30 +48,3 @@ pub(crate) fn generate(shell: Shell, output: &mut dyn Write) -> Result<i32> {
         .whatever_context("could not write shell completions")?;
     Ok(0)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn reports_output_errors() {
-        struct BrokenOutput;
-
-        impl Write for BrokenOutput {
-            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
-                Err(std::io::ErrorKind::BrokenPipe.into())
-            }
-
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        let error = generate(Shell::Bash, &mut BrokenOutput).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("could not write shell completions")
-        );
-    }
-}

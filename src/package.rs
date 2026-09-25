@@ -8,6 +8,9 @@ use walkdir::WalkDir;
 
 use crate::Result;
 
+/// The stable version exposed in imports of direct project dependencies.
+pub const IMPORT_VERSION: &str = "0.0.0";
+
 #[derive(Debug, Clone)]
 pub struct Package {
     pub root: PathBuf,

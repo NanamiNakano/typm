@@ -11,31 +11,26 @@ use crate::Result;
 use crate::context::Context;
 use crate::lockfile::{LockedPackage, Lockfile};
 use crate::manifest::{Dependency, Manifest};
-use crate::package::Package;
-use crate::project::ManagedLink;
+use crate::package::{IMPORT_VERSION, Package};
 use crate::sources::{
     LocatedPackage, PackageIdentity, PackagePin, RefreshPolicy, SourceId, SourceMap,
 };
-
-pub use crate::sources::normalize_git_location;
 
 struct PackageNode {
     id: String,
     location_id: String,
     package: Package,
     namespace: String,
-    source: SourceId,
     pin: Option<PackagePin>,
 }
 
 impl PackageNode {
-    fn new(located: LocatedPackage, identity: PackageIdentity, namespace: String) -> Self {
+    fn new(package: Package, identity: PackageIdentity, namespace: &str) -> Self {
         Self {
-            id: identity.package_id(&namespace),
+            id: identity.package_id(namespace),
             location_id: identity.location_id,
-            package: located.package,
-            namespace,
-            source: located.source,
+            package,
+            namespace: namespace.to_owned(),
             pin: identity.pin,
         }
     }
@@ -48,15 +43,22 @@ impl PackageNode {
     }
 }
 
-struct LinkRequirement {
-    location_id: String,
-    dependency_chain: String,
-    link: ManagedLink,
+struct ImportRequirement {
+    root: NodeIndex,
+    node: NodeIndex,
+    import: ResolvedImport,
+}
+
+pub struct ResolvedImport {
+    pub package: Package,
+    pub namespace: String,
+    pub version: String,
+    pub roots: BTreeSet<String>,
 }
 
 pub struct Resolution {
     pub lock: Lockfile,
-    pub links: Vec<ManagedLink>,
+    pub imports: Vec<ResolvedImport>,
 }
 
 pub struct Resolver<'context> {
@@ -98,9 +100,9 @@ impl<'context> Resolver<'context> {
             self.direct_dependencies.insert(name.clone(), node);
         }
         self.check_cycles()?;
-        let links = self.managed_links()?;
+        let imports = self.resolve_imports()?;
         let lock = self.build_lockfile();
-        Ok(Resolution { lock, links })
+        Ok(Resolution { lock, imports })
     }
 
     fn visit_dependency(
@@ -118,13 +120,13 @@ impl<'context> Resolver<'context> {
             .sources
             .locate(dependency, base, parent, Some(expected))?;
         let identity = self.sources.identity(&located)?;
-        let package_root = located.package.root.clone();
-        let package_node = PackageNode::new(located, identity, dependency.namespace.clone());
+        let LocatedPackage { package, source } = located;
+        let package_root = package.root.clone();
+        let package_node = PackageNode::new(package, identity, &dependency.namespace);
         if let Some(node) = self.package_nodes.get(&package_node.id) {
             return Ok(*node);
         }
         let id = package_node.id.clone();
-        let source = package_node.source.clone();
         let node = self.graph.add_node(package_node);
         self.package_nodes.insert(id, node);
         let manifest = self.sources.manifest(&source, &package_root)?;
@@ -170,38 +172,46 @@ impl<'context> Resolver<'context> {
             .unwrap_or_else(|| self.graph[target].label())
     }
 
-    fn managed_links(&self) -> Result<Vec<ManagedLink>> {
-        let mut requirements: BTreeMap<PathBuf, LinkRequirement> = BTreeMap::new();
+    fn resolve_imports(&self) -> Result<Vec<ResolvedImport>> {
+        let mut requirements: BTreeMap<PathBuf, ImportRequirement> = BTreeMap::new();
         for (name, &root) in &self.direct_dependencies {
             let mut traversal = Dfs::new(&self.graph, root);
             while let Some(index) = traversal.next(&self.graph) {
                 let node = &self.graph[index];
+                // A package reached both directly and through another root needs
+                // both import paths.
+                let version = if index == root {
+                    IMPORT_VERSION
+                } else {
+                    node.package.version.as_str()
+                };
                 let path = PathBuf::from(&node.namespace)
                     .join(&node.package.name)
-                    .join(&node.package.version);
-                let chain = self.dependency_chain(root, index);
+                    .join(version);
                 if let Some(requirement) = requirements.get_mut(&path) {
-                    if requirement.location_id != node.location_id {
+                    if self.graph[requirement.node].location_id != node.location_id {
                         whatever!(
-                            "conflicting sources for {}:\n  {}\n  {}\nBoth require the same namespace, name, and version",
-                            node.label(),
-                            requirement.dependency_chain,
-                            chain
+                            "conflicting sources for @{}/{}:{}:\n  {}\n  {}\nPackages with the same namespace, name, and import version must use the same source",
+                            node.namespace,
+                            node.package.name,
+                            version,
+                            self.dependency_chain(requirement.root, requirement.node),
+                            self.dependency_chain(root, index)
                         );
                     }
-                    requirement.link.roots.insert(name.clone());
+                    requirement.import.roots.insert(name.clone());
                 } else {
-                    let link = ManagedLink {
-                        path: path.clone(),
-                        target: node.package.root.clone(),
-                        roots: BTreeSet::from([name.clone()]),
-                    };
                     requirements.insert(
                         path,
-                        LinkRequirement {
-                            location_id: node.location_id.clone(),
-                            dependency_chain: chain,
-                            link,
+                        ImportRequirement {
+                            root,
+                            node: index,
+                            import: ResolvedImport {
+                                package: node.package.clone(),
+                                namespace: node.namespace.clone(),
+                                version: version.to_owned(),
+                                roots: BTreeSet::from([name.clone()]),
+                            },
                         },
                     );
                 }
@@ -209,7 +219,7 @@ impl<'context> Resolver<'context> {
         }
         Ok(requirements
             .into_values()
-            .map(|requirement| requirement.link)
+            .map(|requirement| requirement.import)
             .collect())
     }
 

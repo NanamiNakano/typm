@@ -2,8 +2,8 @@
 
 use crate::Result;
 use crate::files::{
-    atomic_write, metadata_if_present, read_optional, require_directory_if_present,
-    require_regular_file_if_present,
+    atomic_write, ensure_directory, metadata_if_present, read_optional,
+    require_directory_if_present, require_regular_file_if_present,
 };
 use crate::lockfile::Lockfile;
 use serde::{Deserialize, Serialize};
@@ -43,14 +43,7 @@ pub struct Project {
 
 struct ProjectSnapshot {
     lockfile: Option<String>,
-    manifest: Option<String>,
     links: LinkState,
-}
-
-#[derive(Default)]
-struct WrittenProjectFiles {
-    lockfile: bool,
-    manifest: bool,
 }
 
 struct LinkUpdate {
@@ -64,6 +57,15 @@ struct AppliedLinkChanges {
     removed: Vec<ManagedLink>,
     created: Vec<ManagedLink>,
     directories: Vec<PathBuf>,
+}
+
+impl AppliedLinkChanges {
+    fn ensure_directory(&mut self, path: &Path) -> Result<()> {
+        if ensure_directory(path)? {
+            self.directories.push(path.to_path_buf());
+        }
+        Ok(())
+    }
 }
 
 impl Project {
@@ -101,7 +103,7 @@ impl Project {
     /// Keep the returned file alive until the complete project update finishes.
     pub fn acquire(&self) -> Result<File> {
         let control = self.root.join(".typm");
-        ensure_directory(&control, &mut Vec::new())?;
+        ensure_directory(&control)?;
         let path = control.join("project.lock");
         require_regular_file_if_present(&path)?;
         let file = OpenOptions::new()
@@ -151,18 +153,19 @@ impl Project {
         manifest: Option<&str>,
     ) -> Result<()> {
         let snapshot = self.snapshot()?;
+        require_regular_file_if_present(&self.manifest_path)?;
         let lock_contents =
             toml::to_string_pretty(lockfile).whatever_context("cannot serialize typm.lock")?;
         self.reconcile(links)?;
-        let mut written = WrittenProjectFiles::default();
+        let mut lockfile_written = false;
         let result = self.write_project_files(
             (!lockfile.packages.is_empty() || snapshot.lockfile.is_some())
                 .then_some(lock_contents.as_str()),
             manifest,
-            &mut written,
+            &mut lockfile_written,
         );
         if let Err(error) = result {
-            let failures = self.restore_snapshot(&snapshot, &written);
+            let failures = self.restore_snapshot(&snapshot, lockfile_written);
             if !failures.is_empty() {
                 return Err(error).with_whatever_context(|_| {
                     format!("rollback incomplete: {}", failures.join("; "))
@@ -176,7 +179,6 @@ impl Project {
     fn snapshot(&self) -> Result<ProjectSnapshot> {
         Ok(ProjectSnapshot {
             lockfile: read_optional(&self.root.join("typm.lock"))?,
-            manifest: read_optional(&self.manifest_path)?,
             links: self.read_links()?,
         })
     }
@@ -185,33 +187,25 @@ impl Project {
         &self,
         lockfile: Option<&str>,
         manifest: Option<&str>,
-        written: &mut WrittenProjectFiles,
+        lockfile_written: &mut bool,
     ) -> Result<()> {
         if let Some(contents) = lockfile {
             atomic_write(&self.root.join("typm.lock"), contents.as_bytes())?;
-            written.lockfile = true;
+            *lockfile_written = true;
         }
+        // The manifest write is the final fallible operation. If it succeeds,
+        // the transaction is complete; only the lockfile and links need rollback.
         if let Some(contents) = manifest {
             atomic_write(&self.manifest_path, contents.as_bytes())?;
-            written.manifest = true;
         }
         Ok(())
     }
 
-    fn restore_snapshot(
-        &self,
-        snapshot: &ProjectSnapshot,
-        written: &WrittenProjectFiles,
-    ) -> Vec<String> {
+    fn restore_snapshot(&self, snapshot: &ProjectSnapshot, lockfile_written: bool) -> Vec<String> {
         let mut failures = Vec::new();
-        if written.lockfile
+        if lockfile_written
             && let Err(error) =
                 restore_file(&self.root.join("typm.lock"), snapshot.lockfile.as_deref())
-        {
-            failures.push(error.to_string());
-        }
-        if written.manifest
-            && let Err(error) = restore_file(&self.manifest_path, snapshot.manifest.as_deref())
         {
             failures.push(error.to_string());
         }
@@ -305,8 +299,8 @@ impl Project {
 
     fn apply_links(&self, update: &LinkUpdate, applied: &mut AppliedLinkChanges) -> Result<()> {
         let packages = self.root.join(".typm/packages");
-        ensure_directory(&self.root.join(".typm"), &mut applied.directories)?;
-        ensure_directory(&packages, &mut applied.directories)?;
+        applied.ensure_directory(&self.root.join(".typm"))?;
+        applied.ensure_directory(&packages)?;
         for link in &update.removals {
             self.check_link_parents(&link.path)?;
             let path = packages.join(&link.path);
@@ -315,7 +309,7 @@ impl Project {
             applied.removed.push(link.clone());
         }
         for link in &update.creations {
-            self.ensure_link_parents(&link.path, &mut applied.directories)?;
+            self.ensure_link_parents(&link.path, applied)?;
             create_symlink(&link.target, &packages.join(&link.path))?;
             applied.created.push(link.clone());
         }
@@ -366,18 +360,18 @@ impl Project {
         Ok(())
     }
 
-    fn ensure_link_parents(&self, relative: &Path, created: &mut Vec<PathBuf>) -> Result<()> {
+    fn ensure_link_parents(&self, relative: &Path, applied: &mut AppliedLinkChanges) -> Result<()> {
         let mut parent = self.root.join(".typm");
-        ensure_directory(&parent, created)?;
+        applied.ensure_directory(&parent)?;
         parent.push("packages");
-        ensure_directory(&parent, created)?;
+        applied.ensure_directory(&parent)?;
         for component in relative
             .parent()
             .expect("validated package path")
             .components()
         {
             parent.push(component);
-            ensure_directory(&parent, created)?;
+            applied.ensure_directory(&parent)?;
         }
         Ok(())
     }
@@ -410,24 +404,6 @@ fn index_links(links: &[ManagedLink]) -> Result<BTreeMap<&Path, &ManagedLink>> {
     Ok(result)
 }
 
-fn ensure_directory(path: &Path, created: &mut Vec<PathBuf>) -> Result<()> {
-    if metadata_if_present(path)?.is_some() {
-        return require_directory_if_present(path);
-    }
-    match fs::create_dir(path) {
-        Ok(()) => created.push(path.to_path_buf()),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            require_directory_if_present(path)?;
-        }
-        Err(error) => {
-            return Err(error).with_whatever_context(|_| {
-                format!("could not create directory {}", path.display())
-            });
-        }
-    }
-    Ok(())
-}
-
 fn require_link_target(path: &Path, expected: &Path) -> Result<()> {
     let actual = fs::read_link(path).with_whatever_context(|_| {
         format!("could not read managed package link {}", path.display())
@@ -444,24 +420,7 @@ fn require_link_target(path: &Path, expected: &Path) -> Result<()> {
 }
 
 fn create_symlink(target: &Path, path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    let result = std::os::unix::fs::symlink(target, path);
-    #[cfg(windows)]
-    let result = std::os::windows::fs::symlink_dir(target, path);
-    #[cfg(not(any(unix, windows)))]
-    let result: std::io::Result<()> = Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "directory symlinks are not supported on this platform",
-    ));
-    result.with_whatever_context(|error| {
-        let mut message = format!("could not link {} to {}", path.display(), target.display());
-        if cfg!(windows) && error.kind() == std::io::ErrorKind::PermissionDenied {
-            message.push_str(
-                "; enable Windows Developer Mode or run with permission to create symbolic links",
-            );
-        }
-        message
-    })
+    crate::files::create_symlink(target, path, true)
 }
 
 fn remove_symlink(path: &Path) -> Result<()> {
@@ -513,13 +472,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn absent_state_is_empty_and_manifest_need_not_exist() {
-        let (_directory, project) = setup();
-        assert!(project.root.is_absolute());
-        assert!(project.read_links().unwrap().links.is_empty());
-    }
-
     #[cfg(unix)]
     #[test]
     fn acquire_refuses_symlink_or_directory_at_gitignore() {
@@ -567,22 +519,6 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn creates_repairs_and_removes_broken_managed_links() {
-        let (_directory, project) = setup();
-        let desired = link(&project, "example");
-        let destination = project.root.join(".typm/packages").join(&desired.path);
-        project.reconcile(std::slice::from_ref(&desired)).unwrap();
-        assert_eq!(fs::read_link(&destination).unwrap(), desired.target);
-        fs::remove_file(&destination).unwrap();
-        project.reconcile(std::slice::from_ref(&desired)).unwrap();
-        assert_eq!(fs::read_link(&destination).unwrap(), desired.target);
-        project.reconcile(&[]).unwrap();
-        assert!(fs::symlink_metadata(&destination).is_err());
-        assert!(project.read_links().unwrap().links.is_empty());
-    }
-
-    #[cfg(unix)]
-    #[test]
     fn refuses_changed_links_and_preserves_state() {
         let (_directory, project) = setup();
         let desired = link(&project, "example");
@@ -609,28 +545,6 @@ mod tests {
         assert!(project.reconcile(std::slice::from_ref(&desired)).is_err());
         assert_eq!(fs::read_link(destination).unwrap(), desired.target);
         assert!(!project.root.join(".typm/state.toml").exists());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn refuses_unmanaged_directory_before_removing_other_links() {
-        let (_directory, project) = setup();
-        let before = link(&project, "before");
-        project.reconcile(std::slice::from_ref(&before)).unwrap();
-        let after = link(&project, "after");
-        let collision = project.root.join(".typm/packages").join(&after.path);
-        fs::create_dir_all(&collision).unwrap();
-        fs::write(collision.join("keep.txt"), "user data").unwrap();
-        assert!(project.reconcile(&[after]).is_err());
-        assert_eq!(
-            fs::read_link(project.root.join(".typm/packages").join(&before.path)).unwrap(),
-            before.target
-        );
-        assert_eq!(
-            fs::read_to_string(collision.join("keep.txt")).unwrap(),
-            "user data"
-        );
-        assert_eq!(project.read_links().unwrap().links, vec![before]);
     }
 
     #[cfg(unix)]

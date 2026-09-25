@@ -12,6 +12,7 @@ mod project;
 mod resolver;
 mod shell;
 mod sources;
+mod stubs;
 mod typst;
 
 pub use commands::run;
