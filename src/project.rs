@@ -1,4 +1,4 @@
-//! Project-local package links and the state that records their ownership.
+//! Project-local packages and the state that records their ownership.
 
 use crate::Result;
 use crate::files::{
@@ -6,6 +6,7 @@ use crate::files::{
     require_directory_if_present, require_regular_file_if_present,
 };
 use crate::lockfile::Lockfile;
+use crate::stubs::PackageView;
 use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
 use std::collections::{BTreeMap, BTreeSet};
@@ -17,6 +18,9 @@ pub struct ManagedLink {
     /// A path of the form namespace/name/version, relative to .typm/packages.
     pub path: PathBuf,
     pub target: PathBuf,
+    /// Inline manifest and source links when the import version needs rewriting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view: Option<PackageView>,
     /// Direct project dependencies that make this package reachable.
     pub roots: BTreeSet<String>,
 }
@@ -30,7 +34,7 @@ pub struct LinkState {
 impl Default for LinkState {
     fn default() -> Self {
         Self {
-            version: 1,
+            version: 2,
             links: Vec::new(),
         }
     }
@@ -43,7 +47,7 @@ pub struct Project {
 
 struct ProjectSnapshot {
     lockfile: Option<String>,
-    links: LinkState,
+    state_contents: Option<String>,
 }
 
 struct LinkUpdate {
@@ -54,9 +58,10 @@ struct LinkUpdate {
 
 #[derive(Default)]
 struct AppliedLinkChanges {
-    removed: Vec<ManagedLink>,
+    removed: Vec<(ManagedLink, PathBuf)>,
     created: Vec<ManagedLink>,
     directories: Vec<PathBuf>,
+    state_written: bool,
 }
 
 impl AppliedLinkChanges {
@@ -133,7 +138,9 @@ impl Project {
             .with_whatever_context(|_| format!("could not read link state {}", path.display()))?;
         let state: LinkState = toml::from_str(&contents)
             .with_whatever_context(|_| format!("invalid link state {}", path.display()))?;
-        if state.version != 1 {
+        if !matches!(state.version, 1 | 2)
+            || (state.version == 1 && state.links.iter().any(|link| link.view.is_some()))
+        {
             snafu::whatever!(
                 "unsupported link state version {} in {}",
                 state.version,
@@ -144,8 +151,8 @@ impl Project {
         Ok(state)
     }
 
-    /// File replacements are atomic individually. Roll back ordinary I/O failures
-    /// across the manifest, lockfile and links while holding the project lock.
+    /// Stage complete packages and retain replaced entries until every project
+    /// file is committed, so rollback never has to reconstruct a source tree.
     pub fn update(
         &self,
         lockfile: &Lockfile,
@@ -156,30 +163,60 @@ impl Project {
         require_regular_file_if_present(&self.manifest_path)?;
         let lock_contents =
             toml::to_string_pretty(lockfile).whatever_context("cannot serialize typm.lock")?;
-        self.reconcile(links)?;
+        let update = self.preflight_links(links)?;
+        let staging = tempfile::Builder::new()
+            .prefix(".update-")
+            .tempdir_in(self.root.join(".typm"))
+            .whatever_context("could not create temporary package update")?;
+        let mut applied = AppliedLinkChanges::default();
         let mut lockfile_written = false;
-        let result = self.write_project_files(
-            (!lockfile.packages.is_empty() || snapshot.lockfile.is_some())
-                .then_some(lock_contents.as_str()),
-            manifest,
-            &mut lockfile_written,
-        );
+        let result = self
+            .apply_links(&update, &mut applied, staging.path())
+            .and_then(|()| {
+                self.write_project_files(
+                    (!lockfile.packages.is_empty() || snapshot.lockfile.is_some())
+                        .then_some(lock_contents.as_str()),
+                    manifest,
+                    &mut lockfile_written,
+                )
+            });
         if let Err(error) = result {
-            let failures = self.restore_snapshot(&snapshot, lockfile_written);
+            let mut failures = self.rollback_links(&applied, staging.path());
+            if applied.state_written
+                && let Err(error) = restore_file(
+                    &self.root.join(".typm/state.toml"),
+                    snapshot.state_contents.as_deref(),
+                )
+            {
+                failures.push(error.to_string());
+            }
+            if lockfile_written
+                && let Err(error) =
+                    restore_file(&self.root.join("typm.lock"), snapshot.lockfile.as_deref())
+            {
+                failures.push(error.to_string());
+            }
             if !failures.is_empty() {
+                let backup = staging.keep();
                 return Err(error).with_whatever_context(|_| {
-                    format!("rollback incomplete: {}", failures.join("; "))
+                    format!(
+                        "rollback incomplete: {}; package backups retained at {}",
+                        failures.join("; "),
+                        backup.display()
+                    )
                 });
             }
             return Err(error);
         }
+        let active_targets: Vec<_> = links.iter().map(|link| link.target.clone()).collect();
+        crate::stubs::cleanup_legacy(&self.root.join(".typm"), &active_targets);
         Ok(())
     }
 
     fn snapshot(&self) -> Result<ProjectSnapshot> {
         Ok(ProjectSnapshot {
             lockfile: read_optional(&self.root.join("typm.lock"))?,
-            links: self.read_links()?,
+            state_contents: read_optional(&self.root.join(".typm/state.toml"))?,
         })
     }
 
@@ -201,38 +238,6 @@ impl Project {
         Ok(())
     }
 
-    fn restore_snapshot(&self, snapshot: &ProjectSnapshot, lockfile_written: bool) -> Vec<String> {
-        let mut failures = Vec::new();
-        if lockfile_written
-            && let Err(error) =
-                restore_file(&self.root.join("typm.lock"), snapshot.lockfile.as_deref())
-        {
-            failures.push(error.to_string());
-        }
-        if let Err(error) = self.reconcile(&snapshot.links.links) {
-            failures.push(error.to_string());
-        }
-        failures
-    }
-
-    /// Reconcile links under the project lock. An existing link is owned only
-    /// when its literal target matches the target recorded in state.toml.
-    fn reconcile(&self, desired: &[ManagedLink]) -> Result<()> {
-        let update = self.preflight_links(desired)?;
-        let mut applied = AppliedLinkChanges::default();
-        if let Err(error) = self.apply_links(&update, &mut applied) {
-            let rollback_errors = self.rollback_links(&applied);
-            if !rollback_errors.is_empty() {
-                snafu::whatever!(
-                    "{error}; could not fully restore package links: {}",
-                    rollback_errors.join("; ")
-                );
-            }
-            return Err(error);
-        }
-        Ok(())
-    }
-
     fn preflight_links(&self, desired: &[ManagedLink]) -> Result<LinkUpdate> {
         let previous = self.read_links()?;
         let previous_links = index_links(&previous.links)?;
@@ -250,7 +255,9 @@ impl Project {
             let after = desired_links.get(relative).copied();
             let exists = self.validate_existing_link(relative, before)?;
             match (before, after) {
-                (Some(before), Some(after)) if before.target != after.target => {
+                (Some(before), Some(after))
+                    if before.target != after.target || before.view != after.view =>
+                {
                     if exists {
                         removals.push(before.clone());
                     }
@@ -262,7 +269,7 @@ impl Project {
             }
         }
         let next = LinkState {
-            version: 1,
+            version: 2,
             links: desired_links.values().map(|link| (*link).clone()).collect(),
         };
         let state_contents = toml::to_string_pretty(&next)
@@ -287,6 +294,10 @@ impl Project {
                 path.display()
             );
         };
+        if let Some(view) = &owned.view {
+            view.validate(&path, &owned.target)?;
+            return Ok(true);
+        }
         if !metadata.file_type().is_symlink() {
             snafu::whatever!(
                 "managed package link was replaced by a file or directory: {}",
@@ -297,45 +308,79 @@ impl Project {
         Ok(true)
     }
 
-    fn apply_links(&self, update: &LinkUpdate, applied: &mut AppliedLinkChanges) -> Result<()> {
+    fn apply_links(
+        &self,
+        update: &LinkUpdate,
+        applied: &mut AppliedLinkChanges,
+        staging: &Path,
+    ) -> Result<()> {
         let packages = self.root.join(".typm/packages");
         applied.ensure_directory(&self.root.join(".typm"))?;
         applied.ensure_directory(&packages)?;
-        for link in &update.removals {
-            self.check_link_parents(&link.path)?;
-            let path = packages.join(&link.path);
-            require_link_target(&path, &link.target)?;
-            remove_symlink(&path)?;
-            applied.removed.push(link.clone());
+        for (index, link) in update.creations.iter().enumerate() {
+            let path = staging.join(format!("new-{index}"));
+            if let Some(view) = &link.view {
+                view.create(&path, &link.target)?;
+            } else {
+                create_symlink(&link.target, &path)?;
+            }
         }
-        for link in &update.creations {
+        for (index, link) in update.removals.iter().enumerate() {
+            self.validate_existing_link(&link.path, Some(link))?;
+            let path = packages.join(&link.path);
+            let backup = staging.join(format!("old-{index}"));
+            fs::rename(&path, &backup).with_whatever_context(|_| {
+                format!("could not back up managed package {}", path.display())
+            })?;
+            applied.removed.push((link.clone(), backup));
+        }
+        for (index, link) in update.creations.iter().enumerate() {
             self.ensure_link_parents(&link.path, applied)?;
-            create_symlink(&link.target, &packages.join(&link.path))?;
+            let path = packages.join(&link.path);
+            require_absent(&path)?;
+            fs::rename(staging.join(format!("new-{index}")), &path).with_whatever_context(
+                |_| format!("could not install managed package {}", path.display()),
+            )?;
             applied.created.push(link.clone());
         }
         atomic_write(
             &self.root.join(".typm/state.toml"),
             update.state_contents.as_bytes(),
-        )
+        )?;
+        applied.state_written = true;
+        Ok(())
     }
 
-    fn rollback_links(&self, applied: &AppliedLinkChanges) -> Vec<String> {
+    fn rollback_links(&self, applied: &AppliedLinkChanges, staging: &Path) -> Vec<String> {
         let packages = self.root.join(".typm/packages");
         let mut failures = Vec::new();
-        for link in applied.created.iter().rev() {
+        for (index, link) in applied.created.iter().enumerate().rev() {
             let path = packages.join(&link.path);
             let result = self
-                .check_link_parents(&link.path)
-                .and_then(|()| require_link_target(&path, &link.target))
-                .and_then(|()| remove_symlink(&path));
+                .validate_existing_link(&link.path, Some(link))
+                .and_then(|exists| {
+                    if exists {
+                        fs::rename(&path, staging.join(format!("discard-{index}")))
+                            .with_whatever_context(|_| {
+                                format!("could not roll back package {}", path.display())
+                            })?;
+                    }
+                    Ok(())
+                });
             if let Err(error) = result {
                 failures.push(error.to_string());
             }
         }
-        for link in applied.removed.iter().rev() {
+        for (link, backup) in applied.removed.iter().rev() {
+            let path = packages.join(&link.path);
             let result = self
                 .check_link_parents(&link.path)
-                .and_then(|()| create_symlink(&link.target, &packages.join(&link.path)));
+                .and_then(|()| require_absent(&path))
+                .and_then(|()| {
+                    fs::rename(backup, &path).with_whatever_context(|_| {
+                        format!("could not restore package {}", path.display())
+                    })
+                });
             if let Err(error) = result {
                 failures.push(error.to_string());
             }
@@ -397,6 +442,9 @@ fn index_links(links: &[ManagedLink]) -> Result<BTreeMap<&Path, &ManagedLink>> {
                 link.target.display()
             );
         }
+        if let Some(view) = &link.view {
+            view.validate_definition()?;
+        }
         if result.insert(link.path.as_path(), link).is_some() {
             snafu::whatever!("duplicate package link path {}", link.path.display());
         }
@@ -423,14 +471,14 @@ fn create_symlink(target: &Path, path: &Path) -> Result<()> {
     crate::files::create_symlink(target, path, true)
 }
 
-fn remove_symlink(path: &Path) -> Result<()> {
-    #[cfg(windows)]
-    let result = fs::remove_dir(path);
-    #[cfg(not(windows))]
-    let result = fs::remove_file(path);
-    result.with_whatever_context(|_| {
-        format!("could not remove managed package link {}", path.display())
-    })
+fn require_absent(path: &Path) -> Result<()> {
+    if metadata_if_present(path)?.is_some() {
+        snafu::whatever!(
+            "refusing to replace existing package path {}",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 fn restore_file(path: &Path, original: Option<&str>) -> Result<()> {

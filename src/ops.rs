@@ -143,16 +143,17 @@ fn reconcile_packages(
     let resolution = resolver.resolve(&document.manifest, &project.root)?;
     let mut links = Vec::new();
     for import in resolution.imports {
-        let target = if import.version == import.package.version {
-            import.package.root
+        let view = if import.version == import.package.version {
+            None
         } else {
-            crate::stubs::prepare(&project.root.join(".typm"), &import.package.root)?
+            Some(crate::stubs::PackageView::prepare(&import.package.root)?)
         };
         links.push(ManagedLink {
             path: PathBuf::from(import.namespace)
                 .join(import.package.name)
                 .join(import.version),
-            target,
+            target: import.package.root,
+            view,
             roots: import.roots,
         });
     }
