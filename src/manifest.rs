@@ -1,7 +1,7 @@
 use crate::Result;
 use crate::files::read_optional;
 use crate::git::GitSourceSpec;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use snafu::{ResultExt, whatever};
 use std::collections::BTreeMap;
 use std::fs;
@@ -13,18 +13,18 @@ fn default_namespace() -> String {
     "typm".into()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Dependency {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub git: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub path: Option<PathBuf>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub branch: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub tag: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub rev: Option<String>,
     #[serde(default = "default_namespace")]
     pub namespace: String,
@@ -90,14 +90,14 @@ impl Dependency {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Options {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub outdir: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
     #[serde(default)]

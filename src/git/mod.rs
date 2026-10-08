@@ -13,7 +13,6 @@ use snafu::{OptionExt, ResultExt, whatever};
 
 use crate::Result;
 use crate::context::Context;
-use crate::shell::Shell;
 use transport::Transport;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -115,14 +114,7 @@ pub struct Cache {
 
 impl Cache {
     pub fn new(context: &Context) -> Result<Self> {
-        Self::configured(
-            context.cache_root.clone(),
-            context.shell.clone(),
-            context.config.net.git_fetch_with_cli,
-        )
-    }
-
-    fn configured(root: PathBuf, shell: Shell, fetch_with_cli: bool) -> Result<Self> {
+        let root = &context.cache_root;
         for directory in ["git/db", "git/checkouts", "git/locks"] {
             fs::create_dir_all(root.join(directory)).with_whatever_context(|_| {
                 format!("could not create cache directory {}", root.display())
@@ -133,7 +125,7 @@ impl Cache {
             .whatever_context("could not resolve cache directory")?;
         Ok(Self {
             root,
-            transport: Transport::new(shell, fetch_with_cli),
+            transport: Transport::new(context.shell.clone(), context.config.net.git_fetch_with_cli),
         })
     }
 

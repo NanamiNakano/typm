@@ -19,10 +19,6 @@ pub struct AddOptions {
     pub dependency: Dependency,
 }
 
-pub struct RemoveOptions {
-    pub names: Vec<String>,
-}
-
 pub struct TypstOptions {
     pub arguments: Vec<OsString>,
     pub explicit_manifest: bool,
@@ -72,11 +68,11 @@ fn prepare_dependency(
     Ok(dependency)
 }
 
-pub fn remove(context: &Context, project: &Project, options: RemoveOptions) -> Result<i32> {
+pub fn remove(context: &Context, project: &Project, names: Vec<String>) -> Result<i32> {
     let _guard = project.acquire()?;
     let mut document = ManifestDocument::read(&project.manifest_path)?;
     let previous_lockfile = lockfile::read(&project.root.join("typm.lock"))?;
-    let names: BTreeSet<_> = options.names.into_iter().collect();
+    let names: BTreeSet<_> = names.into_iter().collect();
     for name in &names {
         document.remove(name)?;
     }

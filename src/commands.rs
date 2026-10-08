@@ -3,7 +3,7 @@ use crate::cli::{Args, Command};
 use crate::completions;
 use crate::context::Context;
 use crate::manifest::{self, Dependency};
-use crate::ops::{self, AddOptions, RemoveOptions, TypstOptions};
+use crate::ops::{self, AddOptions, TypstOptions};
 use crate::project::Project;
 
 pub fn run(args: Args) -> Result<i32> {
@@ -40,7 +40,7 @@ pub fn run(args: Args) -> Result<i32> {
                 },
             },
         ),
-        Command::Remove { names } => ops::remove(&context, &project, RemoveOptions { names }),
+        Command::Remove { names } => ops::remove(&context, &project, names),
         Command::Sync => ops::sync(&context, &project),
         Command::Update => ops::update(&context, &project),
         Command::Completions { .. } => unreachable!("completions are handled before project setup"),

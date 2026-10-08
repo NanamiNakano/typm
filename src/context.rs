@@ -5,13 +5,12 @@ use directories::{BaseDirs, ProjectDirs};
 use serde::Deserialize;
 use snafu::{OptionExt, ResultExt, whatever};
 use std::collections::BTreeSet;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
 
 pub struct Context {
     pub cwd: PathBuf,
-    pub home: PathBuf,
     pub cache_root: PathBuf,
     pub config: Config,
     pub shell: Shell,
@@ -25,13 +24,6 @@ pub struct Config {
 #[derive(Debug, Default)]
 pub struct NetConfig {
     pub git_fetch_with_cli: bool,
-}
-
-#[derive(Default)]
-struct Environment {
-    home: Option<OsString>,
-    cache_root: Option<OsString>,
-    git_fetch_with_cli: Option<OsString>,
 }
 
 #[derive(Default, Deserialize)]
@@ -49,51 +41,33 @@ struct NetworkSettings {
 impl Context {
     pub fn new(quiet: bool) -> Result<Self> {
         let cwd = std::env::current_dir().whatever_context("cannot determine current directory")?;
-        let environment = Environment {
-            home: std::env::var_os("TYPM_HOME"),
-            cache_root: std::env::var_os("TYPM_CACHE_DIR"),
-            git_fetch_with_cli: std::env::var_os("TYPM_NET_GIT_FETCH_WITH_CLI"),
-        };
+        let home = std::env::var_os("TYPM_HOME");
+        let cache_root = std::env::var_os("TYPM_CACHE_DIR");
+        let git_fetch_with_cli = std::env::var_os("TYPM_NET_GIT_FETCH_WITH_CLI");
         let default_home = BaseDirs::new().map(|base| base.home_dir().join(".typm"));
         let legacy_cache =
             ProjectDirs::from("", "", "typm").map(|project| project.cache_dir().to_owned());
-        Self::from_environment(cwd, environment, default_home, legacy_cache, quiet)
-    }
-
-    fn from_environment(
-        cwd: PathBuf,
-        environment: Environment,
-        default_home: Option<PathBuf>,
-        legacy_cache: Option<PathBuf>,
-        quiet: bool,
-    ) -> Result<Self> {
-        let explicit_home = environment.home.is_some();
-        let home = match environment.home {
+        let explicit_home = home.is_some();
+        let home = match home {
             Some(path) => environment_path("TYPM_HOME", &path, &cwd)?,
             None => {
                 default_home.whatever_context("could not find a home directory; set TYPM_HOME")?
             }
         };
-        let cache_root = match environment.cache_root {
+        let cache_root = match cache_root {
             Some(path) => environment_path("TYPM_CACHE_DIR", &path, &cwd)?,
             None if explicit_home => home.clone(),
             None => legacy_cache
                 .filter(|path| path.join("git/db").is_dir())
                 .unwrap_or_else(|| home.clone()),
         };
-        let mut context = Self {
+        let config = Config::load(&home, &cwd, git_fetch_with_cli.as_deref())?;
+        Ok(Self {
             cwd,
-            home,
             cache_root,
-            config: Config::default(),
+            config,
             shell: Shell::new(quiet),
-        };
-        context.config = Config::load(
-            &context.home,
-            &context.cwd,
-            environment.git_fetch_with_cli.as_deref(),
-        )?;
-        Ok(context)
+        })
     }
 
     /// Keep the returned file alive while reading or updating shared Git storage.
