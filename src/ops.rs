@@ -8,7 +8,7 @@ use crate::Result;
 use crate::context::Context;
 use crate::files::read_optional;
 use crate::lockfile;
-use crate::manifest::{Dependency, ManifestDocument};
+use crate::manifest::{Dependency, Manifest, ManifestDocument};
 use crate::project::{ManagedLink, Project};
 use crate::resolver::Resolver;
 use crate::sources::{RefreshPolicy, normalize_git_location};
@@ -91,7 +91,7 @@ pub fn remove(context: &Context, project: &Project, options: RemoveOptions) -> R
 }
 
 pub fn sync(context: &Context, project: &Project) -> Result<i32> {
-    let count = prepare_packages(context, project, RefreshPolicy::Preserve)?;
+    let (count, _) = prepare_packages(context, project, RefreshPolicy::Preserve)?;
     context
         .shell
         .status("Synced", &format!("{count} packages linked"));
@@ -99,18 +99,21 @@ pub fn sync(context: &Context, project: &Project) -> Result<i32> {
 }
 
 pub fn update(context: &Context, project: &Project) -> Result<i32> {
-    let count = prepare_packages(context, project, RefreshPolicy::All)?;
+    let (count, _) = prepare_packages(context, project, RefreshPolicy::All)?;
     context
         .shell
         .status("Updated", &format!("{count} packages linked"));
     Ok(0)
 }
 
-pub fn run_typst(context: &Context, project: &Project, options: TypstOptions) -> Result<i32> {
+pub fn run_typst(context: &Context, project: &Project, mut options: TypstOptions) -> Result<i32> {
     if read_optional(&project.manifest_path)?.is_some() {
-        let count = prepare_packages(context, project, RefreshPolicy::Preserve)?;
+        let (count, manifest) = prepare_packages(context, project, RefreshPolicy::Preserve)?;
         if count > 0 {
             context.shell.status("Ready", &format!("{count} packages"));
+        }
+        if let Some(outdir) = manifest.options.outdir {
+            typst::apply_outdir(&mut options.arguments, &context.cwd, &project.root, &outdir)?;
         }
     } else if options.explicit_manifest {
         whatever!(
@@ -121,12 +124,17 @@ pub fn run_typst(context: &Context, project: &Project, options: TypstOptions) ->
     typst::run(&options.arguments, &project.root.join(".typm/packages"))
 }
 
-fn prepare_packages(context: &Context, project: &Project, refresh: RefreshPolicy) -> Result<usize> {
+fn prepare_packages(
+    context: &Context,
+    project: &Project,
+    refresh: RefreshPolicy,
+) -> Result<(usize, Manifest)> {
     let _guard = project.acquire()?;
     let document = ManifestDocument::read_required(&project.manifest_path)?;
     let previous_lockfile = lockfile::read(&project.root.join("typm.lock"))?;
     let resolver = Resolver::new(context, previous_lockfile, refresh);
-    reconcile_packages(project, &document, resolver, false)
+    let count = reconcile_packages(project, &document, resolver, false)?;
+    Ok((count, document.manifest))
 }
 
 /// Resolve and commit the current manifest while the caller holds the project lock.

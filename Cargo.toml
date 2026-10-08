@@ -15,13 +15,6 @@ license = "MIT"
 homepage = "https://github.com/NanamiNakano/typm"
 repository = "https://github.com/NanamiNakano/typm"
 readme = "README.md"
-include = [
-    "/src/**",
-    "/tests/**",
-    "/README.md",
-    "/LICENSE",
-    "/LICENSE-APACHE",
-]
 
 [features]
 default = ["embedded-fonts", "http-server", "self-update"]

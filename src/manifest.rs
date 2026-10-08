@@ -92,7 +92,16 @@ impl Dependency {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct Options {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outdir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Manifest {
+    #[serde(default)]
+    pub options: Options,
     #[serde(default)]
     pub dependencies: BTreeMap<String, Dependency>,
 }

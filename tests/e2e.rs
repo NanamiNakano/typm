@@ -1384,6 +1384,231 @@ fn wrapper_preserves_arguments_environment_working_directory_and_exit_status() {
     assert!(log.ends_with(b"arg=non-utf8-\xff.typ\n"));
 }
 
+fn forwarded_typst_arguments(fixture: &Fixture) -> Vec<String> {
+    fs::read_to_string(&fixture.log)
+        .unwrap()
+        .lines()
+        .filter_map(|line| line.strip_prefix("arg=").map(str::to_owned))
+        .collect()
+}
+
+#[test]
+fn wrapper_omits_the_output_argument_when_outdir_is_not_configured() {
+    for (manifest, command) in [
+        (None, "compile"),
+        (Some("[options]\n[dependencies]\n"), "watch"),
+    ] {
+        let f = Fixture::new();
+        if let Some(manifest) = manifest {
+            fs::write(f.project.join("typm.toml"), manifest).unwrap();
+        }
+        let arguments = [command, "hw/hw1.typ"];
+
+        f.ok(&arguments);
+
+        assert_eq!(forwarded_typst_arguments(&f), arguments);
+        assert!(!f.project.join("out").exists());
+    }
+}
+
+#[test]
+fn outdir_at_the_manifest_root_is_rejected() {
+    let f = Fixture::new();
+    fs::write(f.project.join("typm.toml"), "outdir = 'out'\n").unwrap();
+
+    let error = failure(f.run(&["compile", "hw/hw1.typ"]));
+
+    assert!(error.contains("unknown field `outdir`"), "{error}");
+    assert!(!f.log.exists());
+    assert!(!f.project.join("out").exists());
+}
+
+#[test]
+fn outdir_preserves_project_subpaths_from_nested_working_directories() {
+    for (arguments, filename) in [
+        (vec!["compile", "hw1.typ"], "hw1.pdf"),
+        (vec!["c", "hw1.typ", "-f", "svg"], "hw1.svg"),
+        (vec!["watch", "hw1.typ", "--format=png"], "hw1.png"),
+        (vec!["w", "hw1.typ", "--format", "bundle"], "hw1"),
+    ] {
+        let f = Fixture::new();
+        fs::write(f.project.join("typm.toml"), "[options]\noutdir = 'out'\n").unwrap();
+        let homework = f.project.join("hw");
+        fs::create_dir(&homework).unwrap();
+        fs::write(homework.join("hw1.typ"), "Homework").unwrap();
+
+        success(
+            f.command()
+                .current_dir(&homework)
+                .args(&arguments)
+                .output()
+                .unwrap(),
+        );
+
+        let destination = f.project.join("out/hw").join(filename);
+        let mut expected: Vec<String> = arguments.iter().map(|arg| (*arg).to_owned()).collect();
+        expected.extend(["--".to_owned(), destination.to_str().unwrap().to_owned()]);
+        assert_eq!(forwarded_typst_arguments(&f), expected);
+        assert!(destination.parent().unwrap().is_dir());
+        assert!(!homework.join("out").exists());
+    }
+}
+
+#[test]
+fn outdir_resolves_against_an_explicit_manifest_and_normalizes_input_paths() {
+    let f = Fixture::new();
+    fs::write(f.project.join("typm.toml"), "[options]\noutdir = 'out'\n").unwrap();
+    fs::create_dir(f.project.join("hw")).unwrap();
+    fs::write(f.project.join("hw/hw1.typ"), "Homework").unwrap();
+    let elsewhere = f.temp.path().join("elsewhere");
+    fs::create_dir(&elsewhere).unwrap();
+    let input = "../project/hw/../hw/hw1.typ";
+
+    success(
+        f.command()
+            .current_dir(&elsewhere)
+            .arg("--manifest-path")
+            .arg(f.project.join("typm.toml"))
+            .args(["compile", input])
+            .output()
+            .unwrap(),
+    );
+
+    let output = f.project.join("out/hw/hw1.pdf");
+    assert_eq!(
+        forwarded_typst_arguments(&f),
+        ["compile", input, "--", output.to_str().unwrap()]
+    );
+    assert!(output.parent().unwrap().is_dir());
+    assert!(!elsewhere.join("out").exists());
+}
+
+#[test]
+fn outdir_resolves_absolute_inputs_through_a_project_directory_alias() {
+    let f = Fixture::new();
+    fs::write(f.project.join("typm.toml"), "[options]\noutdir = 'out'\n").unwrap();
+    fs::create_dir(f.project.join("hw")).unwrap();
+    fs::write(f.project.join("hw/hw1.typ"), "Homework").unwrap();
+    let alias = f.temp.path().join("project-alias");
+    symlink(&f.project, &alias).unwrap();
+    let input = alias.join("hw/hw1.typ");
+
+    f.ok(&["compile", input.to_str().unwrap()]);
+
+    let output = f.project.join("out/hw/hw1.pdf");
+    assert_eq!(
+        forwarded_typst_arguments(&f),
+        [
+            "compile",
+            input.to_str().unwrap(),
+            "--",
+            output.to_str().unwrap()
+        ]
+    );
+    assert!(output.parent().unwrap().is_dir());
+}
+
+#[test]
+fn outdir_supports_absolute_directories_and_keeps_output_separate_from_optional_flags() {
+    for arguments in [
+        vec!["compile", "hw/hw1.typ", "--open"],
+        vec!["compile", "--", "hw/hw1.typ"],
+    ] {
+        let f = Fixture::new();
+        let outdir = f.temp.path().join("artifacts");
+        fs::write(
+            f.project.join("typm.toml"),
+            format!("[options]\noutdir = '{}'\n", outdir.display()),
+        )
+        .unwrap();
+        fs::create_dir(f.project.join("hw")).unwrap();
+        fs::write(f.project.join("hw/hw1.typ"), "Homework").unwrap();
+
+        f.ok(&arguments);
+
+        let mut expected: Vec<String> = arguments.iter().map(|arg| (*arg).to_owned()).collect();
+        if !arguments.contains(&"--") {
+            expected.push("--".to_owned());
+        }
+        expected.push(outdir.join("hw/hw1.pdf").to_str().unwrap().to_owned());
+        assert_eq!(forwarded_typst_arguments(&f), expected);
+        assert!(outdir.join("hw").is_dir());
+    }
+}
+
+#[test]
+fn outdir_preserves_explicit_outputs_and_commands_without_automatic_output() {
+    for arguments in [
+        vec!["compile", "hw/hw1.typ", "custom.pdf"],
+        vec!["watch", "hw/hw1.typ", "-"],
+        vec!["compile", "-", "from-stdin.pdf"],
+        vec!["compile", "-"],
+        vec!["compile", "--help"],
+        vec!["compile", "hw/hw1.typ", "--future-typst-option"],
+        vec!["query", "hw/hw1.typ", "<example>"],
+        vec!["fonts"],
+    ] {
+        let f = Fixture::new();
+        fs::write(f.project.join("typm.toml"), "[options]\noutdir = 'out'\n").unwrap();
+
+        f.ok(&arguments);
+
+        assert_eq!(forwarded_typst_arguments(&f), arguments);
+        assert!(!f.project.join("out").exists());
+    }
+}
+
+#[test]
+fn outdir_requires_an_explicit_output_for_inputs_outside_the_project() {
+    let f = Fixture::new();
+    fs::write(f.project.join("typm.toml"), "[options]\noutdir = 'out'\n").unwrap();
+    fs::write(f.temp.path().join("outside.typ"), "Outside").unwrap();
+
+    let error = failure(f.run(&["compile", "../outside.typ"]));
+
+    assert!(error.contains("outside"), "{error}");
+    assert!(error.contains("explicit output"), "{error}");
+    assert!(!f.log.exists());
+    assert!(!f.project.join("out").exists());
+
+    let arguments = ["compile", "../outside.typ", "outside.pdf"];
+    f.ok(&arguments);
+    assert_eq!(forwarded_typst_arguments(&f), arguments);
+}
+
+#[test]
+fn real_typst_compiles_into_nested_outdir() {
+    let typst_available = Command::new("typst")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !typst_available {
+        eprintln!("skipping real compiler check: typst is not installed");
+        return;
+    }
+    let f = Fixture::new();
+    fs::write(f.project.join("typm.toml"), "[options]\noutdir = 'out'\n").unwrap();
+    let homework = f.project.join("hw");
+    fs::create_dir(&homework).unwrap();
+    fs::write(homework.join("hw1.typ"), "= Homework\nHello!").unwrap();
+
+    success(
+        f.command()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .current_dir(&homework)
+            .args(["compile", "hw1.typ"])
+            .output()
+            .unwrap(),
+    );
+
+    assert!(
+        fs::read(f.project.join("out/hw/hw1.pdf"))
+            .unwrap()
+            .starts_with(b"%PDF-")
+    );
+    assert!(!homework.join("hw1.pdf").exists());
+}
+
 #[test]
 fn explicit_manifest_path_and_empty_projects_work() {
     let f = Fixture::new();

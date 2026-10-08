@@ -8,8 +8,8 @@ use snafu::ResultExt;
 use crate::Result;
 use crate::cli::Args;
 
-/// This tree is only for completion generation; execution must keep forwarding
-/// Typst arguments unchanged, including options unknown to the bundled schema.
+/// This tree is only for completion generation; execution forwards the original
+/// Typst arguments, including options unknown to the bundled schema.
 fn command() -> Command {
     let mut command = Args::command();
     let native_names: BTreeSet<_> = command
