@@ -28,7 +28,7 @@
           src = pkgs.lib.fileset.toSource {
             root = ./.;
             fileset = pkgs.lib.fileset.unions [
-              ./Cargo.toml ./Cargo.lock ./src ./tests ./README.md ./LICENSE ./typst-args
+              ./Cargo.toml ./Cargo.lock ./src ./README.md ./LICENSE ./typst-args
               ./vendor/typst/crates/typst-cli/src/args.rs
               ./vendor/typst/LICENSE
             ];

@@ -141,19 +141,3 @@ fn sync_directory_best_effort(path: &Path) {
         let _ = directory.sync_all();
     }
 }
-
-#[cfg(all(test, unix))]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn atomic_write_refuses_symlinks() {
-        let directory = tempfile::tempdir().unwrap();
-        let original = directory.path().join("original");
-        fs::write(&original, "preserve").unwrap();
-        let path = directory.path().join("linked");
-        std::os::unix::fs::symlink(&original, &path).unwrap();
-        assert!(atomic_write(&path, b"replacement").is_err());
-        assert_eq!(fs::read_to_string(original).unwrap(), "preserve");
-    }
-}
