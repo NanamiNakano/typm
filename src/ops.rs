@@ -40,7 +40,7 @@ pub fn add(context: &Context, project: &Project, options: AddOptions) -> Result<
     let mut resolver = Resolver::new(context, previous_lockfile, refresh);
     let name = resolver.infer_name(&dependency, &project.root, name)?;
     document.insert(&name, dependency)?;
-    let count = reconcile_packages(project, &document, resolver, true)?;
+    let count = reconcile_packages(project, &document, resolver, true, false)?;
 
     context
         .shell
@@ -78,7 +78,7 @@ pub fn remove(context: &Context, project: &Project, names: Vec<String>) -> Resul
     }
 
     let resolver = Resolver::new(context, previous_lockfile, RefreshPolicy::Preserve);
-    reconcile_packages(project, &document, resolver, true)?;
+    reconcile_packages(project, &document, resolver, true, false)?;
 
     context
         .shell
@@ -86,8 +86,8 @@ pub fn remove(context: &Context, project: &Project, names: Vec<String>) -> Resul
     Ok(0)
 }
 
-pub fn sync(context: &Context, project: &Project) -> Result<i32> {
-    let (count, _) = prepare_packages(context, project, RefreshPolicy::Preserve)?;
+pub fn sync(context: &Context, project: &Project, force: bool) -> Result<i32> {
+    let (count, _) = prepare_packages(context, project, RefreshPolicy::Preserve, force)?;
     context
         .shell
         .status("Synced", &format!("{count} packages linked"));
@@ -95,7 +95,7 @@ pub fn sync(context: &Context, project: &Project) -> Result<i32> {
 }
 
 pub fn update(context: &Context, project: &Project) -> Result<i32> {
-    let (count, _) = prepare_packages(context, project, RefreshPolicy::All)?;
+    let (count, _) = prepare_packages(context, project, RefreshPolicy::All, false)?;
     context
         .shell
         .status("Updated", &format!("{count} packages linked"));
@@ -104,7 +104,7 @@ pub fn update(context: &Context, project: &Project) -> Result<i32> {
 
 pub fn run_typst(context: &Context, project: &Project, mut options: TypstOptions) -> Result<i32> {
     if read_optional(&project.manifest_path)?.is_some() {
-        let (count, manifest) = prepare_packages(context, project, RefreshPolicy::Preserve)?;
+        let (count, manifest) = prepare_packages(context, project, RefreshPolicy::Preserve, false)?;
         if count > 0 {
             context.shell.status("Ready", &format!("{count} packages"));
         }
@@ -124,12 +124,13 @@ fn prepare_packages(
     context: &Context,
     project: &Project,
     refresh: RefreshPolicy,
+    force: bool,
 ) -> Result<(usize, Manifest)> {
     let _guard = project.acquire()?;
     let document = ManifestDocument::read_required(&project.manifest_path)?;
     let previous_lockfile = lockfile::read(&project.root.join("typm.lock"))?;
     let resolver = Resolver::new(context, previous_lockfile, refresh);
-    let count = reconcile_packages(project, &document, resolver, false)?;
+    let count = reconcile_packages(project, &document, resolver, false, force)?;
     Ok((count, document.manifest))
 }
 
@@ -139,6 +140,7 @@ fn reconcile_packages(
     document: &ManifestDocument,
     resolver: Resolver<'_>,
     write_manifest: bool,
+    force: bool,
 ) -> Result<usize> {
     let resolution = resolver.resolve(&document.manifest, &project.root)?;
     let mut links = Vec::new();
@@ -158,6 +160,6 @@ fn reconcile_packages(
         });
     }
     let manifest = write_manifest.then(|| document.text());
-    project.update(&resolution.lock, &links, manifest.as_deref())?;
+    project.update(&resolution.lock, &links, manifest.as_deref(), force)?;
     Ok(links.len())
 }

@@ -41,7 +41,7 @@ pub fn run(args: Args) -> Result<i32> {
             },
         ),
         Command::Remove { names } => ops::remove(&context, &project, names),
-        Command::Sync => ops::sync(&context, &project),
+        Command::Sync { force } => ops::sync(&context, &project, force),
         Command::Update => ops::update(&context, &project),
         Command::Completions { .. } => unreachable!("completions are handled before project setup"),
         Command::Typst(arguments) => ops::run_typst(

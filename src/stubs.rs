@@ -114,8 +114,7 @@ fn manifest_stub(original: &str) -> Result<String> {
         .filter(|value| value.is_str())
         .and_then(toml_edit::Value::span)
         .whatever_context("package manifest must contain a string package.version")?;
-    // Replace only the parsed value token, preserving the rest of the original
-    // document byte for byte, including comments, CRLFs, and unknown fields.
+    // Preserve the original document except for the version and a missing final newline.
     let token = &original[version.clone()];
     let quote = if token.starts_with("\"\"\"") {
         "\"\"\""
@@ -128,6 +127,9 @@ fn manifest_stub(original: &str) -> Result<String> {
     };
     let mut stub = original.to_owned();
     stub.replace_range(version, &format!("{quote}{IMPORT_VERSION}{quote}"));
+    if !stub.ends_with('\n') {
+        stub.push('\n');
+    }
     Ok(stub)
 }
 

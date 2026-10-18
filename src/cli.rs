@@ -47,7 +47,11 @@ pub enum Command {
         names: Vec<String>,
     },
     /// Download missing dependencies and repair links, preserving locked Git commits.
-    Sync,
+    Sync {
+        /// Recreate all managed package links, even if unchanged or modified.
+        #[arg(short, long)]
+        force: bool,
+    },
     /// Update all Git dependencies within their declared refs and refresh package links.
     Update,
     /// Generate shell completions for typm and its wrapped Typst commands.

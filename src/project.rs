@@ -158,12 +158,13 @@ impl Project {
         lockfile: &Lockfile,
         links: &[ManagedLink],
         manifest: Option<&str>,
+        force: bool,
     ) -> Result<()> {
         let snapshot = self.snapshot()?;
         require_regular_file_if_present(&self.manifest_path)?;
         let lock_contents =
             toml::to_string_pretty(lockfile).whatever_context("cannot serialize typm.lock")?;
-        let update = self.preflight_links(links)?;
+        let update = self.preflight_links(links, force)?;
         let staging = tempfile::Builder::new()
             .prefix(".update-")
             .tempdir_in(self.root.join(".typm"))
@@ -171,7 +172,7 @@ impl Project {
         let mut applied = AppliedLinkChanges::default();
         let mut lockfile_written = false;
         let result = self
-            .apply_links(&update, &mut applied, staging.path())
+            .apply_links(&update, &mut applied, staging.path(), force)
             .and_then(|()| {
                 self.write_project_files(
                     (!lockfile.packages.is_empty() || snapshot.lockfile.is_some())
@@ -238,7 +239,7 @@ impl Project {
         Ok(())
     }
 
-    fn preflight_links(&self, desired: &[ManagedLink]) -> Result<LinkUpdate> {
+    fn preflight_links(&self, desired: &[ManagedLink], force: bool) -> Result<LinkUpdate> {
         let previous = self.read_links()?;
         let previous_links = index_links(&previous.links)?;
         let desired_links = index_links(desired)?;
@@ -253,10 +254,10 @@ impl Project {
         for relative in paths {
             let before = previous_links.get(relative).copied();
             let after = desired_links.get(relative).copied();
-            let exists = self.validate_existing_link(relative, before)?;
+            let exists = self.validate_existing_link(relative, before, force)?;
             match (before, after) {
                 (Some(before), Some(after))
-                    if before.target != after.target || before.view != after.view =>
+                    if force || before.target != after.target || before.view != after.view =>
                 {
                     if exists {
                         removals.push(before.clone());
@@ -282,7 +283,12 @@ impl Project {
         })
     }
 
-    fn validate_existing_link(&self, relative: &Path, owned: Option<&ManagedLink>) -> Result<bool> {
+    fn validate_existing_link(
+        &self,
+        relative: &Path,
+        owned: Option<&ManagedLink>,
+        force: bool,
+    ) -> Result<bool> {
         self.check_link_parents(relative)?;
         let path = self.root.join(".typm/packages").join(relative);
         let Some(metadata) = metadata_if_present(&path)? else {
@@ -294,6 +300,9 @@ impl Project {
                 path.display()
             );
         };
+        if force {
+            return Ok(true);
+        }
         if let Some(view) = &owned.view {
             view.validate(&path, &owned.target)?;
             return Ok(true);
@@ -313,6 +322,7 @@ impl Project {
         update: &LinkUpdate,
         applied: &mut AppliedLinkChanges,
         staging: &Path,
+        force: bool,
     ) -> Result<()> {
         let packages = self.root.join(".typm/packages");
         applied.ensure_directory(&self.root.join(".typm"))?;
@@ -326,7 +336,7 @@ impl Project {
             }
         }
         for (index, link) in update.removals.iter().enumerate() {
-            self.validate_existing_link(&link.path, Some(link))?;
+            self.validate_existing_link(&link.path, Some(link), force)?;
             let path = packages.join(&link.path);
             let backup = staging.join(format!("old-{index}"));
             fs::rename(&path, &backup).with_whatever_context(|_| {
@@ -357,7 +367,7 @@ impl Project {
         for (index, link) in applied.created.iter().enumerate().rev() {
             let path = packages.join(&link.path);
             let result = self
-                .validate_existing_link(&link.path, Some(link))
+                .validate_existing_link(&link.path, Some(link), false)
                 .and_then(|exists| {
                     if exists {
                         fs::rename(&path, staging.join(format!("discard-{index}")))
